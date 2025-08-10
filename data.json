@@ -1,0 +1,26 @@
+{
+  "bloggers": {
+    "1080067724": {
+      "username": "test",
+      "subs": "5000",
+      "platforms": "VK",
+      "theme": "\u0436\u0438\u0437\u043d\u044c",
+      "reach_screenshot": "AgACAgIAAxkBAAIBJWiYwf3kdDN6yi5rY_8tKa5gOA99AAJq9jEbkNHJSIbpLihyR6v-AQADAgADeQADNgQ"
+    }
+  },
+  "orders": {
+    "1080067724": {
+      "platform": "Wildberries",
+      "order_date": "2025-09-08"
+    }
+  },
+  "payments": {
+    "8bad049e-ba21-4c4d-9021-726ab9c4bbe2": {
+      "user_id": "1080067724",
+      "order_photo": "AgACAgIAAxkBAAIBJWiYwf3kdDN6yi5rY_8tKa5gOA99AAJq9jEbkNHJSIbpLihyR6v-AQADAgADeQADNgQ",
+      "barcode_photo": "AgACAgIAAxkBAAIBJWiYwf3kdDN6yi5rY_8tKa5gOA99AAJq9jEbkNHJSIbpLihyR6v-AQADAgADeQADNgQ",
+      "text": "5500 4050 3256 8754 \u0414\u0430\u043d\u0438\u043b\u0430 \u0413\u0430\u0437\u0438\u043c\u0443\u043b\u043b\u0438\u043d",
+      "timestamp": "2025-08-10T21:00:44.708465"
+    }
+  }
+}
