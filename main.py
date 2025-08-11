@@ -270,9 +270,65 @@ def main():
     app.add_handler(payment_handler)
     app.add_handler(MessageHandler(filters.TEXT, handle_text))
 
-    app.run_polling()
+async def health(request):
+    return web.Response(text="ok")
+
+async def runner():
+    # --- HTTP-сервер для Render (healthcheck) ---
+    port = int(os.environ.get("PORT", 8080))
+    web_app = web.Application()
+    web_app.add_routes([web.get("/", health), web.get("/healthz", health)])
+    app_runner = web.AppRunner(web_app)
+    await app_runner.setup()
+    site = web.TCPSite(app_runner, "0.0.0.0", port)
+    await site.start()
+
+    # --- Telegram bot (PTB 20.7) ---
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Регистрируем все твои хендлеры (как у тебя выше)
+    # ВАЖНО: эти 4 строки ниже — копируют то, что у тебя в main()
+    # (оставь их как есть, если выше уже объявлены функции-хендлеры)
+    form_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex("Заполнить анкету"), ask_username)],
+        states={
+            ASK_USERNAME: [MessageHandler(filters.TEXT, save_username)],
+            ASK_SUBS: [MessageHandler(filters.TEXT, save_subs)],
+            ASK_PLATFORMS: [MessageHandler(filters.TEXT, save_platforms)],
+            ASK_THEME: [MessageHandler(filters.TEXT, save_theme)],
+            ASK_STATS: [MessageHandler(filters.PHOTO, save_stats)],
+        },
+        fallbacks=[],
+    )
+    payment_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex("Отправить на оплату"), ask_payment)],
+        states={
+            WAITING_ORDER_PHOTO: [MessageHandler(filters.PHOTO, save_order_photo)],
+            WAITING_BARCODE_PHOTO: [MessageHandler(filters.PHOTO, save_barcode_photo)],
+            WAITING_PAYMENT_TEXT: [MessageHandler(filters.TEXT, save_payment_text)],
+        },
+        fallbacks=[],
+    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("export", export_to_excel))
+    app.add_handler(form_handler)
+    app.add_handler(payment_handler)
+    app.add_handler(MessageHandler(filters.TEXT, handle_text))
+
+    # Запускаем PTB в async-режиме рядом с HTTP
+    await app.initialize()
+    await app.start()
+    # На всякий случай уберём вебхук (если был) и начнём polling
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    await app.updater.start_polling()
+    await app.updater.wait_until_shutdown()
+
+    # Корректная остановка
+    await app.stop()
+    await app.shutdown()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(runner())
+
 
 
