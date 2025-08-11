@@ -286,13 +286,14 @@ async def runner():
     await app.initialize()
     await app.start()
     await app.bot.delete_webhook(drop_pending_updates=True)
-    await app.updater.start_polling()
-    logging.info("Bot polling started")
-    await app.updater.wait_until_shutdown()
+    await app.start_polling()
+    await app.wait_until_shutdown()
 
     await app.stop()
     await app.shutdown()
+
     logging.info("Bot stopped")
 
 if __name__ == "__main__":
     asyncio.run(runner())
+
