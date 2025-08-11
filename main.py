@@ -2,12 +2,12 @@ import os
 import sys
 import json
 import uuid
-import asyncio
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
-from aiohttp import web
 import pandas as pd
 import telegram
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
@@ -27,10 +27,8 @@ logging.info(f"PTB_RUNTIME {telegram.__version__} | PY_RUNTIME {sys.version}")
 # ---------- ENV ----------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 if not BOT_TOKEN:
     logging.error("BOT_TOKEN не найден в переменных окружения!")
-    # не выходим — чтобы было видно логи на Render, но бот не запустится без токена
 
 # ---------- КОНСТАНТЫ ----------
 (ASK_USERNAME, ASK_SUBS, ASK_PLATFORMS, ASK_THEME, ASK_STATS,
@@ -234,22 +232,28 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Данные экспортированы в Excel файлы: bloggers.xlsx, orders.xlsx, payments.xlsx"
     )
 
-# ---------- HTTP + BOT RUNNER ----------
-async def health(request):
-    return web.Response(text="ok")
+# ---------- HEALTHCHECK (для Render) ----------
+def start_health_server():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        def log_message(self, *_):
+            # приглушаем логи http-сервера
+            pass
 
-async def runner():
-    # HTTP healthcheck для Render
     port = int(os.environ.get("PORT", 8080))
-    web_app = web.Application()
-    web_app.add_routes([web.get("/", health), web.get("/healthz", health)])
-    app_runner = web.AppRunner(web_app)
-    await app_runner.setup()
-    site = web.TCPSite(app_runner, "0.0.0.0", port)
-    await site.start()
+    srv = HTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     logging.info(f"Healthcheck server started on :{port}")
 
-    # Telegram bot (PTB 20.7)
+# ---------- ЗАПУСК ----------
+if __name__ == "__main__":
+    # 1) healthcheck для бесплатного Web Service
+    start_health_server()
+
+    # 2) Telegram bot (PTB 21.x)
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Анкета
@@ -282,18 +286,5 @@ async def runner():
     app.add_handler(payment_handler)
     app.add_handler(MessageHandler(filters.TEXT, handle_text))
 
-    # Запуск PTB рядом с HTTP
-    await app.initialize()
-    await app.start()
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    await app.start_polling()
-    await app.wait_until_shutdown()
-
-    await app.stop()
-    await app.shutdown()
-
-    logging.info("Bot stopped")
-
-if __name__ == "__main__":
-    asyncio.run(runner())
-
+    # Один вызов — блокирующий polling для v21.x
+    app.run_polling(drop_pending_updates=True)
