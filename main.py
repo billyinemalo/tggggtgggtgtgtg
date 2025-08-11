@@ -7,7 +7,7 @@ import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 import pandas as pd
@@ -55,7 +55,7 @@ if not BOT_TOKEN:
     ADMIN_WAITING_STATUS_USER,
     ADMIN_WAITING_RECEIPT,
     ADMIN_WAITING_BROADCAST_TEXT,
-    ADMIN_WAITING_SEGCAST_TEXT,   # ← текст для рассылки по сегменту
+    ADMIN_WAITING_SEGCAST_TEXT,
 ) = range(14)
 
 DATA_DIR = "data"
@@ -70,7 +70,7 @@ PLATFORMS = ["Wildberries", "Ozon"]
 # --- сегменты ---
 SEG_FILLED = "filled_form"
 SEG_GOT_TZ = "got_tz"
-SEG_DONE = "task_done"
+SEG_DONE = "links_received"
 SEG_REQ_PAY = "requested_pay"
 SEG_PAID = "paid"
 SEG_NOT_PAID = "not_paid"
@@ -219,9 +219,6 @@ def format_user_status(user_id: str, data: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 def compute_segments() -> Dict[str, List[str]]:
-    """
-    Возвращает словарь сегментов -> список user_id (строки).
-    """
     data = ensure_data_schema()
     bloggers = data.get("bloggers", {})
     orders = data.get("orders", {})
@@ -229,13 +226,9 @@ def compute_segments() -> Dict[str, List[str]]:
 
     filled = set(bloggers.keys())
     got_tz = set(orders.keys())
-    # выполнено ТЗ — есть ссылки (links_received)
     done = {uid for uid, o in orders.items() if o.get("status") == "links_received"}
-    # запросили оплату — есть записи в payments
     req_pay = {p.get("user_id") for p in payments.values() if p.get("user_id")}
-    # оплачено
     paid = {p.get("user_id") for p in payments.values() if p.get("status") == "paid"}
-    # не оплачено = запросили - оплачено
     not_paid = req_pay - paid
 
     return {
@@ -258,10 +251,6 @@ def segment_human_name(seg: str) -> str:
     }.get(seg, seg)
 
 def format_segment_list(title: str, uids: List[str], bloggers: Dict[str, Any], max_lines: int = 200) -> str:
-    """
-    Возвращает текстовый блок списка пользователей для сегмента.
-    max_lines — ограничение, чтобы не взрывать сообщение.
-    """
     lines = [f"— {title}: {len(uids)}"]
     cnt = 0
     for uid in uids:
@@ -388,11 +377,10 @@ async def send_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    # платформа с минимальной нагрузкой
     counts = {p: sum(1 for x in orders.values() if x.get("platform") == p) for p in PLATFORMS}
     platform = min(counts, key=counts.get) if counts else PLATFORMS[0]
 
-    # даты: оформление = завтра; дедлайн = +4 дней (на заказ/выкуп 3–4 дня)
+    # оформление = завтра; дедлайн = +4 дней (на заказ/выкуп 3–4 дня)
     today = datetime.now().date()
     order_date = (today + timedelta(days=1)).strftime("%Y-%m-%d")
     deadline = (today + timedelta(days=4)).strftime("%Y-%m-%d")
@@ -546,7 +534,7 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     save_data(data)
 
-    # === Авто-экспорт в единый Excel ===
+    # авто-экспорт в единый Excel
     try:
         export_payments_excel()
     except Exception as e:
@@ -557,7 +545,7 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=menu_after_links(user_id)
     )
 
-    # ---- Админу: 2 фото (медиагруппа) + одно сообщение с инлайн-кнопкой ----
+    # ---- Админу: медиагруппа + сообщение с инлайн-кнопкой ----
     app = context.application
     media = []
     if context.user_data.get("order_photo"):
@@ -570,10 +558,8 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.exception("send_media_group failed", exc_info=e)
 
-    # никнейм
     bloggers = data.get("bloggers", {})
     uname = bloggers.get(user_id, {}).get("username", "")
-
     links_text = "\n".join(f"- {u}" for u in links) if links else "—"
     admin_text = (
         f"💰 Заявка на оплату #{payment_id}\n"
@@ -583,7 +569,6 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💳 Данные для выплаты:\n{pay_text}\n\n"
         f"Нажмите «Оплата произведена», затем пришлите чек — он уйдёт пользователю."
     )
-
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"✅ Оплата произведена #{payment_id}", callback_data=f"pay_done:{payment_id}")]
     ])
@@ -631,6 +616,9 @@ async def on_admin_pay_done_callback(update: Update, context: ContextTypes.DEFAU
 
 # --- Админ: приём чека и уведомление пользователя ---
 async def admin_wait_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != ADMIN_ID:
+        return ConversationHandler.END
+
     wait_map = context.bot_data.get("await_receipt_by_admin", {})
     payment_id = wait_map.get(str(update.effective_user.id))
 
@@ -691,10 +679,14 @@ async def admin_wait_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ----- Админ: статус по user_id -----
 async def admin_status_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != ADMIN_ID:
+        return ConversationHandler.END
     await update.message.reply_text("Отправьте user_id, по которому показать статус.")
     return ADMIN_WAITING_STATUS_USER
 
 async def admin_status_wait_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != ADMIN_ID:
+        return ConversationHandler.END
     uid = (update.message.text or "").strip()
     data = ensure_data_schema()
     if uid not in data["bloggers"] and uid not in data["orders"]:
@@ -705,7 +697,6 @@ async def admin_status_wait_uid(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ----- Админ: общая сводка и рассылка по сегментам -----
 SEGCAST_PREFIX = "segcast:"        # выбрать сегмент для рассылки
-SEGLIST_PREFIX = "seglist:"        # (опционально) показать список целиком — если надо
 SEGCONFIRM_PREFIX = "segconfirm:"  # подтверждение отправки yes/no
 
 async def admin_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -716,7 +707,6 @@ async def admin_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     segments = compute_segments()
 
     blocks = []
-    # формируем текст со списками (ограничим списки до 200 строк на сегмент)
     for seg_key in [SEG_FILLED, SEG_GOT_TZ, SEG_DONE, SEG_REQ_PAY, SEG_PAID, SEG_NOT_PAID]:
         title = segment_human_name(seg_key)
         uids = segments.get(seg_key, [])
@@ -724,7 +714,6 @@ async def admin_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "📈 Сводка статусов (по пользователям):\n\n" + "\n\n".join(blocks)
 
-    # инлайн-кнопки: рассылка по каждому сегменту
     kb_rows = []
     for seg_key in [SEG_FILLED, SEG_GOT_TZ, SEG_DONE, SEG_REQ_PAY, SEG_PAID, SEG_NOT_PAID]:
         kb_rows.append([InlineKeyboardButton(f"📣 Рассылка: {segment_human_name(seg_key)}", callback_data=f"{SEGCAST_PREFIX}{seg_key}")])
@@ -742,7 +731,7 @@ async def on_segcast_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["segcast_target"] = seg_key
     name = segment_human_name(seg_key)
     await q.message.reply_text(f"Выбран сегмент: «{name}».\nПришлите текст рассылки для этого сегмента.")
-    return  # дальше поймаем текст в обработчике ниже
+    return ADMIN_WAITING_SEGCAST_TEXT   # <— важное изменение
 
 async def admin_segment_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != ADMIN_ID:
@@ -757,7 +746,6 @@ async def admin_segment_broadcast_text(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("Текст пустой. Отменено.", reply_markup=menu_admin)
         return ConversationHandler.END
 
-    # посчитаем получателей
     segments = compute_segments()
     target_ids = segments.get(seg_key, [])
     context.user_data["segcast_text"] = text
@@ -784,7 +772,6 @@ async def on_segment_broadcast_confirm(update: Update, context: ContextTypes.DEF
         await q.edit_message_text("Рассылка по сегменту отменена.")
         return
 
-    # yes — отправляем
     text = context.user_data.get("segcast_text", "")
     target_ids: List[str] = context.user_data.get("segcast_ids", [])
     ok, fail = 0, 0
@@ -814,10 +801,14 @@ BROADCAST_PREVIEW_CB_YES = "broadcast:yes"
 BROADCAST_PREVIEW_CB_NO = "broadcast:no"
 
 async def admin_broadcast_ask_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != ADMIN_ID:
+        return ConversationHandler.END
     await update.message.reply_text("Пришлите текст рассылки. Будет отправлен всем, кто активировал бота (заполнил анкету).")
     return ADMIN_WAITING_BROADCAST_TEXT
 
 async def admin_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != ADMIN_ID:
+        return ConversationHandler.END
     text = (update.message.text or "").strip()
     if not text:
         await update.message.reply_text("Текст пустой. Отменено.", reply_markup=menu_admin)
@@ -1055,21 +1046,26 @@ if __name__ == "__main__":
         fallbacks=[],
     )
 
-    # Админ: рассылка по сегменту — ловим текст после выбора сегмента
-    admin_segcast_text_handler = MessageHandler(
-        filters.TEXT & filters.User(user_id=int(ADMIN_ID)), admin_segment_broadcast_text
+    # Админ: рассылка по сегменту — отдельный Conversation (важно! чтобы не ловить обычные тексты)
+    admin_segcast_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(on_segcast_choose, pattern=r"^segcast:")],
+        states={
+            ADMIN_WAITING_SEGCAST_TEXT: [
+                MessageHandler(filters.TEXT & filters.User(user_id=int(ADMIN_ID)), admin_segment_broadcast_text)
+            ],
+        },
+        fallbacks=[],
     )
 
     # Callback’и
     app.add_handler(CallbackQueryHandler(on_admin_pay_done_callback, pattern=r"^pay_done:"))
     app.add_handler(CallbackQueryHandler(on_broadcast_confirm, pattern=r"^broadcast:(yes|no)$"))
-    app.add_handler(CallbackQueryHandler(on_segcast_choose, pattern=rf"^{SEGCAST_PREFIX}"))
-    app.add_handler(CallbackQueryHandler(on_segment_broadcast_confirm, pattern=rf"^{SEGCONFIRM_PREFIX}(yes|no)$"))
+    app.add_handler(CallbackQueryHandler(on_segment_broadcast_confirm, pattern=r"^segconfirm:(yes|no)$"))
 
     # Прочие кнопки
-    reconsider_handler = MessageHandler(filters.TEXT & filters.Regex("Я передумал\\(-а\\)"), reconsider)
-    launch_handler = MessageHandler(filters.TEXT & filters.Regex("^🚀 Запустить бота$"), launch)
-    restart_handler = MessageHandler(filters.TEXT & filters.Regex("^🔁 Перезапустить бота$"), restart)
+    reconsider_handler = MessageHandler(filters.TEXT & filters.Regex(r"^🔁 Я передумал\(-а\)$"), reconsider)
+    launch_handler = MessageHandler(filters.TEXT & filters.Regex(r"^🚀 Запустить бота$"), launch)
+    restart_handler = MessageHandler(filters.TEXT & filters.Regex(r"^🔁 Перезапустить бота$"), restart)
 
     # Регистрация
     app.add_handler(CommandHandler("start", start))
@@ -1081,7 +1077,7 @@ if __name__ == "__main__":
     app.add_handler(admin_status_handler)
     app.add_handler(admin_receipt_handler)
     app.add_handler(admin_broadcast_handler)
-    app.add_handler(admin_segcast_text_handler)
+    app.add_handler(admin_segcast_conv)          # ← новый conv для сегментной рассылки
     app.add_handler(reconsider_handler)
     app.add_handler(launch_handler)
     app.add_handler(restart_handler)
