@@ -25,9 +25,9 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    filters,
     ContextTypes,
     ConversationHandler,
+    filters,
 )
 
 # ---------- ЛОГИ И ВЕРСИИ ----------
@@ -56,13 +56,16 @@ if not BOT_TOKEN:
     ADMIN_WAITING_RECEIPT,
     ADMIN_WAITING_BROADCAST_TEXT,
     ADMIN_WAITING_SEGCAST_TEXT,
-) = range(14)
+    ADMIN_WAITING_DRAFT_TEXT,
+) = range(15)
 
 DATA_DIR = "data"
+MEDIA_DIR = "media"
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 DECLINES_FILE = os.path.join(DATA_DIR, "declines.json")
 PAYMENTS_EXPORT_XLSX = os.path.join(DATA_DIR, "payments_export.xlsx")
-ADMIN_ID = "1080067724"  # твой Telegram ID
+ADMIN_ID = "1080067724"  # твой Telegram ID (строкой)
+MODERATOR_IDS: List[str] = []      # добавь сюда id модераторов строками при необходимости
 
 # Площадки (Sima-Land удалён)
 PLATFORMS = ["Wildberries", "Ozon"]
@@ -75,9 +78,24 @@ SEG_REQ_PAY = "requested_pay"
 SEG_PAID = "paid"
 SEG_NOT_PAID = "not_paid"
 
+# --- callback prefixes ---
+SEGCAST_PREFIX = "segcast:"        # выбрать сегмент для рассылки
+SEGCONFIRM_PREFIX = "segconfirm:"  # подтверждение отправки yes/no
+BROADCAST_PREVIEW_CB_YES = "broadcast:yes"
+BROADCAST_PREVIEW_CB_NO = "broadcast:no"
+SEGEXPORT_PREFIX = "segexport:"    # экспорт сегмента в excel
+
+# ---------- РОЛИ ----------
+def is_admin(uid: str) -> bool:
+    return uid == ADMIN_ID
+
+def is_mod(uid: str) -> bool:
+    return uid in MODERATOR_IDS or is_admin(uid)
+
 # ---------- МЕНЮ ----------
 def with_admin(menu: ReplyKeyboardMarkup, uid: str) -> ReplyKeyboardMarkup:
-    if uid == ADMIN_ID:
+    # для админа/модератора добавим кнопку входа в их меню
+    if is_mod(uid):
         rows = []
         for row in menu.keyboard:
             rows.append([KeyboardButton(b.text) for b in row])
@@ -113,8 +131,10 @@ menu_after_decline_base = ReplyKeyboardMarkup([
 
 menu_admin = ReplyKeyboardMarkup([
     [KeyboardButton("📊 Статус по пользователю"), KeyboardButton("📤 Выгрузка в Excel")],
-    [KeyboardButton("📣 Рассылка"), KeyboardButton("📈 Сводка статусов")],
-    [KeyboardButton("⬅️ Назад")],
+    [KeyboardButton("📈 Сводка статусов"), KeyboardButton("🧾 Неоплаченные заявки")],
+    [KeyboardButton("📣 Рассылка"), KeyboardButton("💾 Сохранить черновик"), KeyboardButton("🗂 Черновики")],
+    [KeyboardButton("🔎 /find ник"), KeyboardButton("🔎 /findid id"), KeyboardButton("📅 /stats 01.08-11.08")],
+    [KeyboardButton("👥 Рефералы"), KeyboardButton("⬅️ Назад")],
 ], resize_keyboard=True)
 
 def menu_start(uid: str): return with_admin(menu_start_base, uid)
@@ -124,7 +144,15 @@ def menu_after_decline(uid: str): return with_admin(menu_after_decline_base, uid
 
 # ---------- ПОДГОТОВКА ХРАНИЛИЩА ----------
 os.makedirs(DATA_DIR, exist_ok=True)
-DEFAULT_DATA: Dict[str, Any] = {"bloggers": {}, "orders": {}, "payments": {}}
+os.makedirs(MEDIA_DIR, exist_ok=True)
+
+DEFAULT_DATA: Dict[str, Any] = {
+    "bloggers": {},     # user_id -> profile/answers + 'ref_by'
+    "orders": {},       # user_id -> {platform, order_date, deadline, status, links, tz_assigned_at, reminder_sent}
+    "payments": {},     # payment_id -> {...}
+    "drafts": [],       # [{text, ts}]
+    "referrals": {},    # ref_id -> [user_ids...]
+}
 
 def load_data() -> Dict[str, Any]:
     if not os.path.exists(DATA_FILE):
@@ -143,9 +171,9 @@ def ensure_data_schema() -> Dict[str, Any]:
     except Exception:
         data = {}
     changed = False
-    for k in DEFAULT_DATA:
-        if k not in data or not isinstance(data[k], dict):
-            data[k] = {}
+    for k, default_val in DEFAULT_DATA.items():
+        if k not in data or not isinstance(data[k], type(default_val)):
+            data[k] = default_val if not isinstance(default_val, dict) else {}
             changed = True
     if changed:
         save_data(data)
@@ -165,7 +193,7 @@ def append_decline(user_id: str, reason: str):
     with open(DECLINES_FILE, "w", encoding="utf-8") as f:
         json.dump(items, f, ensure_ascii=False, indent=2)
 
-# ---------- УТИЛИТЫ ДЛЯ СЦЕНАРИЯ ----------
+# ---------- УТИЛИТЫ ----------
 def user_filled_form(user_id: str) -> bool:
     data = ensure_data_schema()
     return user_id in data["bloggers"]
@@ -191,6 +219,7 @@ def reset_user_flow(context: ContextTypes.DEFAULT_TYPE, user_id: str):
     context.user_data.clear()
 
 def short_payment_id() -> str:
+    # короткий ID типа PAYA1B2C3
     return "PAY" + secrets.token_hex(3).upper()
 
 def format_user_status(user_id: str, data: Dict[str, Any]) -> str:
@@ -203,14 +232,16 @@ def format_user_status(user_id: str, data: Dict[str, Any]) -> str:
     platform = o.get("platform") or "—"
     order_date = o.get("order_date") or "—"
     deadline = o.get("deadline") or "—"
+    ref_by = u.get("ref_by") or "—"
     lines = [
         f"👤 user_id: {user_id}",
         f"• Ник/канал: {uname}",
         f"• Подписчики: {subs}",
         f"• Платформа: {platform}",
         f"• Дата оформления: {order_date}",
-        f"• Дедлайн заказа: {deadline}",
+        f"• Дедлайн на заказ: {deadline}",
         f"• Статус: {status}",
+        f"• Реферер: {ref_by}",
     ]
     if links:
         lines.append("• Ссылки:")
@@ -286,6 +317,15 @@ def export_payments_excel():
     df = pd.DataFrame(rows, columns=["Никнейм", "ТГ айди", "Данные для оплаты", "Ссылка на ролик"])
     df.to_excel(PAYMENTS_EXPORT_XLSX, index=False)
 
+# ---- Сохранение фото локально ----
+async def save_photo_locally(bot, file_id: str, path: str):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tg_file = await bot.get_file(file_id)
+        await tg_file.download_to_drive(path)
+    except Exception as e:
+        logging.exception(f"Не удалось сохранить файл {path}", exc_info=e)
+
 # ---------- HEALTHCHECK ----------
 def start_health_server():
     class Handler(BaseHTTPRequestHandler):
@@ -297,9 +337,28 @@ def start_health_server():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     logging.info(f"Healthcheck server started on :{port}")
 
-# ---------- ХЕНДЛЕРЫ ----------
+# ---------- ХЕНДЛЕРЫ: /start и запуск ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
+    # реферал: /start ref_123
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("ref_"):
+            ref_by = arg[4:]
+            data = ensure_data_schema()
+            # сохраним реферера только один раз
+            if uid not in data["bloggers"]:
+                data["bloggers"][uid] = {}
+            if not data["bloggers"][uid].get("ref_by"):
+                data["bloggers"][uid]["ref_by"] = ref_by
+                # запишем в список рефералов
+                refs = data.get("referrals", {})
+                lst = set(refs.get(ref_by, []))
+                lst.add(uid)
+                refs[ref_by] = sorted(list(lst))
+                data["referrals"] = refs
+                save_data(data)
+
     await update.message.reply_text(
         "Привет! Мы рады сотрудничеству с вами 🎉\n"
         "1) Нажмите «📋 Заполнить анкету».\n"
@@ -351,7 +410,11 @@ async def save_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = ensure_data_schema()
     user_id = str(update.effective_user.id)
-    data["bloggers"][user_id] = dict(context.user_data)
+    blogger = data["bloggers"].get(user_id, {})
+    blogger.update(dict(context.user_data))
+    if not blogger.get("username"):  # подстрахуем
+        blogger["username"] = update.effective_user.username or ""
+    data["bloggers"][user_id] = blogger
     save_data(data)
 
     await update.message.reply_text(
@@ -380,7 +443,7 @@ async def send_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     counts = {p: sum(1 for x in orders.values() if x.get("platform") == p) for p in PLATFORMS}
     platform = min(counts, key=counts.get) if counts else PLATFORMS[0]
 
-    # оформление = завтра; дедлайн = +4 дней (на заказ/выкуп 3–4 дня)
+    # оформление = завтра; дедлайн = +4 дня (на заказ/выкуп 3–4 дня)
     today = datetime.now().date()
     order_date = (today + timedelta(days=1)).strftime("%Y-%m-%d")
     deadline = (today + timedelta(days=4)).strftime("%Y-%m-%d")
@@ -390,7 +453,9 @@ async def send_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "order_date": order_date,
         "deadline": deadline,
         "status": "assigned",
-        "links": []
+        "links": [],
+        "tz_assigned_at": datetime.now().isoformat(),
+        "reminder_sent": False,
     }
     save_data(data)
 
@@ -500,6 +565,9 @@ async def save_order_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_ORDER_PHOTO
     photo = update.message.photo[-1]
     context.user_data["order_photo"] = photo.file_id
+    # сохраняем локально
+    user_id = str(update.effective_user.id)
+    await save_photo_locally(context.application.bot, photo.file_id, os.path.join(MEDIA_DIR, user_id, "order.jpg"))
     await update.message.reply_text("2️⃣ Теперь пришлите фото разрезанного штрихкода на упаковке:")
     return WAITING_BARCODE_PHOTO
 
@@ -509,6 +577,8 @@ async def save_barcode_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return WAITING_BARCODE_PHOTO
     photo = update.message.photo[-1]
     context.user_data["barcode_photo"] = photo.file_id
+    user_id = str(update.effective_user.id)
+    await save_photo_locally(context.application.bot, photo.file_id, os.path.join(MEDIA_DIR, user_id, "barcode.jpg"))
     await update.message.reply_text("3️⃣ Теперь напишите номер карты и ФИО держателя текстом:")
     return WAITING_PAYMENT_TEXT
 
@@ -531,6 +601,7 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "timestamp": datetime.now().isoformat(),
         "status": "pending",
         "admin_msg_id": None,
+        "admin_remind_sent": False,
     }
     save_data(data)
 
@@ -584,7 +655,7 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ----- Админ: клик по инлайн-кнопке «Оплата произведена #... » -----
 async def on_admin_pay_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if not is_admin(str(update.effective_user.id)):
         await update.callback_query.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -616,7 +687,7 @@ async def on_admin_pay_done_callback(update: Update, context: ContextTypes.DEFAU
 
 # --- Админ: приём чека и уведомление пользователя ---
 async def admin_wait_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if not is_admin(str(update.effective_user.id)):
         return ConversationHandler.END
 
     wait_map = context.bot_data.get("await_receipt_by_admin", {})
@@ -630,7 +701,8 @@ async def admin_wait_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Это не фото. Пришлите фото чека.")
         return ADMIN_WAITING_RECEIPT
 
-    photo_id = update.message.photo[-1].file_id
+    photo = update.message.photo[-1]
+    photo_id = photo.file_id
 
     data = ensure_data_schema()
     pay = data["payments"].get(payment_id)
@@ -639,6 +711,8 @@ async def admin_wait_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     user_id = pay["user_id"]
+    # сохраняем чек локально
+    await save_photo_locally(context.application.bot, photo_id, os.path.join(MEDIA_DIR, str(user_id), f"receipt_{payment_id}.jpg"))
 
     app = context.application
     try:
@@ -679,13 +753,13 @@ async def admin_wait_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ----- Админ: статус по user_id -----
 async def admin_status_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if not is_mod(str(update.effective_user.id)):
         return ConversationHandler.END
     await update.message.reply_text("Отправьте user_id, по которому показать статус.")
     return ADMIN_WAITING_STATUS_USER
 
 async def admin_status_wait_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if not is_mod(str(update.effective_user.id)):
         return ConversationHandler.END
     uid = (update.message.text or "").strip()
     data = ensure_data_schema()
@@ -695,12 +769,39 @@ async def admin_status_wait_uid(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text(format_user_status(uid, data), reply_markup=menu_admin)
     return ConversationHandler.END
 
-# ----- Админ: общая сводка и рассылка по сегментам -----
-SEGCAST_PREFIX = "segcast:"        # выбрать сегмент для рассылки
-SEGCONFIRM_PREFIX = "segconfirm:"  # подтверждение отправки yes/no
+# ----- Поиск (админ/модератор) -----
+async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_mod(str(update.effective_user.id)):
+        return
+    q = " ".join(context.args) if context.args else ""
+    if not q:
+        await update.message.reply_text("Использование: /find <часть ника>", reply_markup=menu_admin); return
+    data = ensure_data_schema()
+    bloggers = data.get("bloggers", {})
+    matches = []
+    for uid, b in bloggers.items():
+        name = (b.get("username") or "").lower()
+        if q.lower() in name:
+            matches.append(uid)
+    if not matches:
+        await update.message.reply_text("Ничего не найдено.", reply_markup=menu_admin); return
+    resp = "\n\n".join(format_user_status(uid, data) for uid in matches[:20])
+    await update.message.reply_text(resp, reply_markup=menu_admin)
 
+async def cmd_findid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_mod(str(update.effective_user.id)):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /findid <user_id>", reply_markup=menu_admin); return
+    uid = context.args[0].strip()
+    data = ensure_data_schema()
+    if uid not in data["bloggers"] and uid not in data["orders"]:
+        await update.message.reply_text("Пользователь не найден.", reply_markup=menu_admin); return
+    await update.message.reply_text(format_user_status(uid, data), reply_markup=menu_admin)
+
+# ----- Админ: общая сводка и рассылка по сегментам -----
 async def admin_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if not is_mod(str(update.effective_user.id)):
         return
     data = ensure_data_schema()
     bloggers = data.get("bloggers", {})
@@ -716,13 +817,18 @@ async def admin_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     kb_rows = []
     for seg_key in [SEG_FILLED, SEG_GOT_TZ, SEG_DONE, SEG_REQ_PAY, SEG_PAID, SEG_NOT_PAID]:
-        kb_rows.append([InlineKeyboardButton(f"📣 Рассылка: {segment_human_name(seg_key)}", callback_data=f"{SEGCAST_PREFIX}{seg_key}")])
+        kb_rows.append([
+            InlineKeyboardButton(f"📣 Рассылка: {segment_human_name(seg_key)}", callback_data=f"{SEGCAST_PREFIX}{seg_key}")
+        ])
+        kb_rows.append([
+            InlineKeyboardButton(f"🧾 Экспорт: {segment_human_name(seg_key)}", callback_data=f"{SEGEXPORT_PREFIX}{seg_key}")
+        ])
 
     kb = InlineKeyboardMarkup(kb_rows)
     await update.message.reply_text(text, reply_markup=kb)
 
 async def on_segcast_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if not is_mod(str(update.effective_user.id)):
         await update.callback_query.answer("Недостаточно прав", show_alert=True)
         return
     q = update.callback_query
@@ -731,10 +837,10 @@ async def on_segcast_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["segcast_target"] = seg_key
     name = segment_human_name(seg_key)
     await q.message.reply_text(f"Выбран сегмент: «{name}».\nПришлите текст рассылки для этого сегмента.")
-    return ADMIN_WAITING_SEGCAST_TEXT   # <— важное изменение
+    return ADMIN_WAITING_SEGCAST_TEXT   # важно: теперь ждём текст только после выбора сегмента
 
 async def admin_segment_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if not is_mod(str(update.effective_user.id)):
         return ConversationHandler.END
     seg_key = context.user_data.get("segcast_target")
     if not seg_key:
@@ -760,7 +866,7 @@ async def admin_segment_broadcast_text(update: Update, context: ContextTypes.DEF
     return ConversationHandler.END
 
 async def on_segment_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if not is_mod(str(update.effective_user.id)):
         await update.callback_query.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -796,18 +902,50 @@ async def on_segment_broadcast_confirm(update: Update, context: ContextTypes.DEF
     except Exception:
         await app.bot.send_message(ADMIN_ID, report)
 
-# ----- Админ: рассылка всем (глобальная) -----
-BROADCAST_PREVIEW_CB_YES = "broadcast:yes"
-BROADCAST_PREVIEW_CB_NO = "broadcast:no"
+# Экспорт сегмента
+def export_segment_to_excel(seg_key: str) -> str:
+    data = ensure_data_schema()
+    bloggers = data.get("bloggers", {})
+    segments = compute_segments()
+    uids = segments.get(seg_key, [])
 
+    rows = []
+    for uid in uids:
+        o = data["orders"].get(uid, {})
+        b = bloggers.get(uid, {})
+        rows.append({
+            "user_id": uid,
+            "Никнейм": b.get("username", ""),
+            "Статус": o.get("status", ""),
+            "Платформа": o.get("platform", ""),
+            "Дата оформления": o.get("order_date", ""),
+            "Дедлайн": o.get("deadline", ""),
+            "Ссылка": (o.get("links") or [""])[0]
+        })
+    df = pd.DataFrame(rows)
+    path = os.path.join(DATA_DIR, f"export_seg_{seg_key}.xlsx")
+    df.to_excel(path, index=False)
+    return path
+
+async def on_segexport(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_mod(str(update.effective_user.id)):
+        await update.callback_query.answer("Недостаточно прав", show_alert=True)
+        return
+    q = update.callback_query
+    await q.answer()
+    seg_key = q.data.split(":", 1)[1]
+    p = export_segment_to_excel(seg_key)
+    await q.message.reply_document(open(p, "rb"), filename=os.path.basename(p), caption=f"Экспорт: {segment_human_name(seg_key)}")
+
+# ----- Админ: рассылка всем (глобальная) -----
 async def admin_broadcast_ask_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if not is_mod(str(update.effective_user.id)):
         return ConversationHandler.END
     await update.message.reply_text("Пришлите текст рассылки. Будет отправлен всем, кто активировал бота (заполнил анкету).")
     return ADMIN_WAITING_BROADCAST_TEXT
 
 async def admin_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if not is_mod(str(update.effective_user.id)):
         return ConversationHandler.END
     text = (update.message.text or "").strip()
     if not text:
@@ -831,7 +969,7 @@ async def admin_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 async def on_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if not is_mod(str(update.effective_user.id)):
         await update.callback_query.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -869,7 +1007,127 @@ async def on_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         await app.bot.send_message(ADMIN_ID, report)
 
-# Связь с менеджером
+# ----- Черновики рассылок -----
+async def admin_save_draft_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_mod(str(update.effective_user.id)):
+        return ConversationHandler.END
+    await update.message.reply_text("Пришлите текст, который сохранить как черновик.")
+    return ADMIN_WAITING_DRAFT_TEXT
+
+async def admin_save_draft_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_mod(str(update.effective_user.id)):
+        return ConversationHandler.END
+    t = (update.message.text or "").strip()
+    if not t:
+        await update.message.reply_text("Пусто. Отменено.", reply_markup=menu_admin)
+        return ConversationHandler.END
+    data = ensure_data_schema()
+    drafts = data.get("drafts", [])
+    drafts.insert(0, {"text": t, "ts": datetime.now().isoformat()})
+    data["drafts"] = drafts[:50]  # храним максимум 50
+    save_data(data)
+    await update.message.reply_text("Черновик сохранён ✅", reply_markup=menu_admin)
+    return ConversationHandler.END
+
+async def admin_list_drafts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_mod(str(update.effective_user.id)):
+        return
+    data = ensure_data_schema()
+    drafts = data.get("drafts", [])[:5]
+    if not drafts:
+        await update.message.reply_text("Черновиков нет.", reply_markup=menu_admin); return
+    lines = ["🗂 Последние черновики:"]
+    for i, d in enumerate(drafts, 1):
+        preview = d["text"][:120].replace("\n", " ")
+        lines.append(f"{i}) {preview} …  ({d['ts']})")
+    await update.message.reply_text("\n".join(lines), reply_markup=menu_admin)
+
+# ----- Рефералы -----
+async def admin_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_mod(str(update.effective_user.id)):
+        return
+    data = ensure_data_schema()
+    refs = data.get("referrals", {})
+    if not refs:
+        await update.message.reply_text("Пока нет рефералов.", reply_markup=menu_admin); return
+    # топ по количеству
+    items = sorted(refs.items(), key=lambda kv: len(kv[1]), reverse=True)[:20]
+    lines = ["👥 Топ рефереров:"]
+    for ref_id, lst in items:
+        lines.append(f"• {ref_id}: {len(lst)} приглашённых")
+    await update.message.reply_text("\n".join(lines), reply_markup=menu_admin)
+
+# ----- Неоплаченные заявки -----
+async def admin_unpaid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_mod(str(update.effective_user.id)):
+        return
+    data = ensure_data_schema()
+    payments = data.get("payments", {})
+    bloggers = data.get("bloggers", {})
+    pending = [(pid, p) for pid, p in payments.items() if p.get("status") == "pending"]
+    if not pending:
+        await update.message.reply_text("Нет неоплаченных заявок.", reply_markup=menu_admin); return
+    lines = ["🧾 Неоплаченные заявки:"]
+    for pid, p in pending[:50]:
+        uid = p.get("user_id", "")
+        uname = bloggers.get(uid, {}).get("username", "")
+        lines.append(f"• #{pid} — {uname} (id:{uid})")
+    await update.message.reply_text("\n".join(lines), reply_markup=menu_admin)
+
+# ----- Статистика за период -----
+def try_parse_date(s: str) -> Optional[datetime]:
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            pass
+    return None
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_mod(str(update.effective_user.id)):
+        return
+    if not context.args:
+        await update.message.reply_text("Формат: /stats 01.08.2025-11.08.2025", reply_markup=menu_admin); return
+    rng = "".join(context.args)
+    if "-" not in rng:
+        await update.message.reply_text("Укажите интервал через дефис: 01.08.2025-11.08.2025", reply_markup=menu_admin); return
+    a, b = rng.split("-", 1)
+    dt1, dt2 = try_parse_date(a.strip()), try_parse_date(b.strip())
+    if not dt1 or not dt2:
+        await update.message.reply_text("Не разобрал даты. Примеры: 01.08.2025-11.08.2025 или 2025-08-01-2025-08-11", reply_markup=menu_admin); return
+    if dt2 < dt1:
+        dt1, dt2 = dt2, dt1
+
+    data = ensure_data_schema()
+    bloggers = data.get("bloggers", {})
+    orders = data.get("orders", {})
+    payments = data.get("payments", {})
+
+    def in_range(ts: str) -> bool:
+        try:
+            dt = datetime.fromisoformat(ts)
+            return dt1 <= dt <= dt2
+        except Exception:
+            return False
+
+    # считаем по timestamp'ам, если есть; иначе приблизительно по датам в полях
+    filled = sum(1 for u in bloggers.values() if in_range(u.get("ts", datetime.now().isoformat())))
+    got_tz = sum(1 for o in orders.values() if in_range(o.get("tz_assigned_at", datetime.now().isoformat())))
+    done = sum(1 for o in orders.values() if o.get("status") == "links_received" and in_range(o.get("tz_assigned_at", datetime.now().isoformat())))
+    req_pay = sum(1 for p in payments.values() if in_range(p.get("timestamp", datetime.now().isoformat())))
+    paid = sum(1 for p in payments.values() if p.get("status") == "paid" and in_range(p.get("timestamp", datetime.now().isoformat())))
+
+    text = (
+        f"📅 Статистика {dt1.date()} — {dt2.date()}:\n"
+        f"• Заполнили анкету: {filled}\n"
+        f"• Получили ТЗ: {got_tz}\n"
+        f"• Выполнили ТЗ: {done}\n"
+        f"• Запросили оплату: {req_pay}\n"
+        f"• Оплачено: {paid}\n"
+    )
+    await update.message.reply_text(text, reply_markup=menu_admin)
+
+# ----- Связь с менеджером -----
 async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     if order_status(uid) == "links_received":
@@ -880,13 +1138,13 @@ async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = menu_start(uid)
     await update.message.reply_text("По вопросам пишите: @billyinemalo1", reply_markup=kb)
 
-# Роутер по кнопкам
+# ----- Роутер по кнопкам -----
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     text = (update.message.text or "").strip()
 
-    # Админские кнопки
-    if uid == ADMIN_ID:
+    # Админ/модератор
+    if is_mod(uid):
         if text == "👑 Админ-меню":
             await update.message.reply_text("Админ-меню:", reply_markup=menu_admin); return
         if text == "📤 Выгрузка в Excel":
@@ -897,10 +1155,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await admin_broadcast_ask_text(update, context)
         if text == "📈 Сводка статусов":
             return await admin_summary(update, context)
+        if text == "🧾 Неоплаченные заявки":
+            return await admin_unpaid(update, context)
+        if text == "💾 Сохранить черновик":
+            return await admin_save_draft_ask(update, context)
+        if text == "🗂 Черновики":
+            return await admin_list_drafts(update, context)
+        if text == "👥 Рефералы":
+            return await admin_referrals(update, context)
         if text == "⬅️ Назад":
             await start(update, context); return
 
-    # Пользовательские кнопки
+    # Пользовательские
     if text == "🚀 Запустить бота":
         return await launch(update, context)
     if text == "🔁 Перезапустить бота":
@@ -920,9 +1186,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "📞 Связаться с менеджером":
         return await contact(update, context)
 
-# Экспорт (только админ — общий экспорт всех таблиц)
+# ----- Экспорт (общий) -----
 async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if not is_mod(str(update.effective_user.id)):
         return
     data = ensure_data_schema()
 
@@ -978,6 +1244,60 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception:
         pass
+
+# ---------- АВТО-НАПОМИНАНИЯ (JobQueue) ----------
+async def job_scan_reminders(context: ContextTypes.DEFAULT_TYPE):
+    # Раз в час: 1) напомнить пользователям с assigned и просроченным дедлайном; 2) напомнить админу о просроченных выплатах (>7 дней)
+    data = ensure_data_schema()
+    orders = data.get("orders", {})
+    payments = data.get("payments", {})
+
+    today = datetime.now().date()
+
+    # 1) Напоминания пользователям
+    for uid, o in list(orders.items()):
+        if o.get("status") == "assigned":
+            deadline = o.get("deadline")
+            if deadline:
+                try:
+                    d = datetime.strptime(deadline, "%Y-%m-%d").date()
+                except Exception:
+                    d = today
+                if today >= d and not o.get("reminder_sent"):
+                    try:
+                        await context.application.bot.send_message(
+                            uid,
+                            "Напоминание ⏰\nСрок оформления и выкупа по ТЗ подошёл. "
+                            "Пожалуйста, завершите задачу и пришлите ссылки («✅ Задача выполнена»)."
+                        )
+                        o["reminder_sent"] = True
+                        data["orders"][uid] = o
+                        save_data(data)
+                    except Exception:
+                        pass
+
+    # 2) Напоминания админу по выплатам > 7 дней
+    for pid, p in list(payments.items()):
+        if p.get("status") == "pending" and not p.get("admin_remind_sent"):
+            ts = p.get("timestamp")
+            try:
+                t0 = datetime.fromisoformat(ts) if ts else datetime.now()
+            except Exception:
+                t0 = datetime.now()
+            if datetime.now() - t0 >= timedelta(days=7):
+                uid = p.get("user_id")
+                bloggers = data.get("bloggers", {})
+                uname = bloggers.get(uid, {}).get("username", "")
+                try:
+                    await context.application.bot.send_message(
+                        ADMIN_ID,
+                        f"⏰ Просроченная выплата #{pid}\nПользователь: {uname} (id:{uid})"
+                    )
+                    p["admin_remind_sent"] = True
+                    data["payments"][pid] = p
+                    save_data(data)
+                except Exception:
+                    pass
 
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
@@ -1046,7 +1366,14 @@ if __name__ == "__main__":
         fallbacks=[],
     )
 
-    # Админ: рассылка по сегменту — отдельный Conversation (важно! чтобы не ловить обычные тексты)
+    # Админ: сохранение черновика
+    admin_draft_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^💾 Сохранить черновик$"), admin_save_draft_ask)],
+        states={ADMIN_WAITING_DRAFT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_save_draft_text)]},
+        fallbacks=[],
+    )
+
+    # Админ: рассылка по сегменту — отдельный Conversation (фикс «Сегмент не выбран»)
     admin_segcast_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(on_segcast_choose, pattern=r"^segcast:")],
         states={
@@ -1060,6 +1387,7 @@ if __name__ == "__main__":
     # Callback’и
     app.add_handler(CallbackQueryHandler(on_admin_pay_done_callback, pattern=r"^pay_done:"))
     app.add_handler(CallbackQueryHandler(on_broadcast_confirm, pattern=r"^broadcast:(yes|no)$"))
+    app.add_handler(CallbackQueryHandler(on_segexport, pattern=r"^segexport:"))
     app.add_handler(CallbackQueryHandler(on_segment_broadcast_confirm, pattern=r"^segconfirm:(yes|no)$"))
 
     # Прочие кнопки
@@ -1067,9 +1395,13 @@ if __name__ == "__main__":
     launch_handler = MessageHandler(filters.TEXT & filters.Regex(r"^🚀 Запустить бота$"), launch)
     restart_handler = MessageHandler(filters.TEXT & filters.Regex(r"^🔁 Перезапустить бота$"), restart)
 
+    # Команды для админа/модераторов
+    app.add_handler(CommandHandler("find", cmd_find))
+    app.add_handler(CommandHandler("findid", cmd_findid))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("start", start))  # поддержка /start с ref-параметром
+
     # Регистрация
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("export", export_to_excel))
     app.add_handler(form_handler)
     app.add_handler(payment_handler)
     app.add_handler(done_handler)
@@ -1077,10 +1409,14 @@ if __name__ == "__main__":
     app.add_handler(admin_status_handler)
     app.add_handler(admin_receipt_handler)
     app.add_handler(admin_broadcast_handler)
-    app.add_handler(admin_segcast_conv)          # ← новый conv для сегментной рассылки
+    app.add_handler(admin_draft_handler)
+    app.add_handler(admin_segcast_conv)
     app.add_handler(reconsider_handler)
     app.add_handler(launch_handler)
     app.add_handler(restart_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Периодический скан напоминаний (каждый час)
+    app.job_queue.run_repeating(job_scan_reminders, interval=3600, first=60)
 
     app.run_polling(drop_pending_updates=True)
