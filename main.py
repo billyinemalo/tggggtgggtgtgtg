@@ -2,19 +2,29 @@ import os
 import sys
 import json
 import uuid
+import secrets
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 import pandas as pd
 import telegram
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InputMediaPhoto,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
     ConversationHandler,
@@ -44,22 +54,29 @@ if not BOT_TOKEN:
     WAITING_DECLINE_REASON,
     ADMIN_WAITING_STATUS_USER,
     ADMIN_WAITING_RECEIPT,
-    ADMIN_WAITING_BROADCAST,
+    ADMIN_WAITING_BROADCAST_TEXT,
 ) = range(13)
 
 DATA_DIR = "data"
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 DECLINES_FILE = os.path.join(DATA_DIR, "declines.json")
 PAYMENTS_EXPORT_XLSX = os.path.join(DATA_DIR, "payments_export.xlsx")
-ADMIN_ID = "1080067724"
+ADMIN_ID = "1080067724"  # твой Telegram ID
 
-# Только эти площадки
+# Площадки (Sima-Land удалён)
 PLATFORMS = ["Wildberries", "Ozon"]
 
 # ---------- МЕНЮ ----------
 def with_admin(menu: ReplyKeyboardMarkup, uid: str) -> ReplyKeyboardMarkup:
     if uid == ADMIN_ID:
-        rows = [list(map(lambda b: KeyboardButton(b.text), row)) for row in menu.keyboard]
+        # Добавим кнопку "Админ-меню" ко всем базовым меню
+        rows = []
+        for row in menu.keyboard:
+            new_row = []
+            for b in row:
+                # b — KeyboardButton
+                new_row.append(KeyboardButton(b.text))
+            rows.append(new_row)
         rows.append([KeyboardButton("👑 Админ-меню")])
         return ReplyKeyboardMarkup(rows, resize_keyboard=True)
     return menu
@@ -103,20 +120,20 @@ def menu_after_decline(uid: str): return with_admin(menu_after_decline_base, uid
 
 # ---------- ПОДГОТОВКА ХРАНИЛИЩА ----------
 os.makedirs(DATA_DIR, exist_ok=True)
-DEFAULT_DATA = {"bloggers": {}, "orders": {}, "payments": {}}
+DEFAULT_DATA: Dict[str, Any] = {"bloggers": {}, "orders": {}, "payments": {}}
 
-def load_data():
+def load_data() -> Dict[str, Any]:
     if not os.path.exists(DATA_FILE):
         save_data(DEFAULT_DATA.copy())
         return DEFAULT_DATA.copy()
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def save_data(data: dict):
+def save_data(data: Dict[str, Any]):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def ensure_data_schema() -> dict:
+def ensure_data_schema() -> Dict[str, Any]:
     try:
         data = load_data()
     except Exception:
@@ -131,7 +148,7 @@ def ensure_data_schema() -> dict:
     return data
 
 def append_decline(user_id: str, reason: str):
-    items = []
+    items: List[Dict[str, Any]] = []
     if os.path.exists(DECLINES_FILE):
         try:
             with open(DECLINES_FILE, "r", encoding="utf-8") as f:
@@ -144,7 +161,7 @@ def append_decline(user_id: str, reason: str):
     with open(DECLINES_FILE, "w", encoding="utf-8") as f:
         json.dump(items, f, ensure_ascii=False, indent=2)
 
-# ---------- УТИЛИТЫ ----------
+# ---------- УТИЛИТЫ ДЛЯ СЦЕНАРИЯ ----------
 def user_filled_form(user_id: str) -> bool:
     data = ensure_data_schema()
     return user_id in data["bloggers"]
@@ -153,13 +170,15 @@ def user_has_order(user_id: str) -> bool:
     data = ensure_data_schema()
     return user_id in data["orders"]
 
-def order_status(user_id: str) -> str | None:
+def order_status(user_id: str) -> Optional[str]:
     data = ensure_data_schema()
     return data["orders"].get(user_id, {}).get("status")
 
-def set_order_links_received(user_id: str, links: list[str]):
+def set_order_links_received(user_id: str, links: List[str]):
     data = ensure_data_schema()
-    o = data["orders"].setdefault(user_id, {"platform": None, "order_date": None, "deadline": None, "status": "assigned", "links": []})
+    o = data["orders"].setdefault(user_id, {
+        "platform": None, "order_date": None, "deadline": None, "status": "assigned", "links": []
+    })
     o["links"] = o.get("links", []) + links
     o["status"] = "links_received"
     save_data(data)
@@ -167,11 +186,11 @@ def set_order_links_received(user_id: str, links: list[str]):
 def reset_user_flow(context: ContextTypes.DEFAULT_TYPE, user_id: str):
     context.user_data.clear()
 
-def short_id(n: int = 8) -> str:
-    # короткий ID платежа
-    return uuid.uuid4().hex[:n]
+def short_payment_id() -> str:
+    # короткий ID для удобства
+    return "PAY" + secrets.token_hex(3).upper()
 
-def format_user_status(user_id: str, data: dict) -> str:
+def format_user_status(user_id: str, data: Dict[str, Any]) -> str:
     u = data["bloggers"].get(user_id, {})
     o = data["orders"].get(user_id, {})
     status = o.get("status", "—")
@@ -196,28 +215,28 @@ def format_user_status(user_id: str, data: dict) -> str:
             lines.append(f"   {i}. {l}")
     return "\n".join(lines)
 
-def export_payments_excel(data: dict):
-    """Автоматический экспорт всех заявок в один XLSX (payments_export.xlsx)."""
-    rows = []
+# ---- Авто-экспорт заявок в единый Excel ----
+def export_payments_excel():
+    data = ensure_data_schema()
     bloggers = data.get("bloggers", {})
     payments = data.get("payments", {})
 
+    rows = []
     for pid, p in payments.items():
         uid = p.get("user_id", "")
         user = bloggers.get(uid, {})
-        nickname = user.get("username", "")
-        paytext = p.get("text", "")
+        uname = user.get("username", "")
+        pay_text = p.get("text", "")
         links = p.get("links", []) or []
-        links_joined = "\n".join(links) if isinstance(links, list) else str(links)
-
+        first_link = links[0] if links else ""
         rows.append({
-            "Никнейм": nickname,
-            "TG ID": uid,
-            "Данные для оплаты": paytext,
-            "Ссылки на ролик": links_joined,
+            "Никнейм": uname,
+            "ТГ айди": uid,
+            "Данные для оплаты": pay_text,
+            "Ссылка на ролик": first_link,
         })
 
-    df = pd.DataFrame(rows, columns=["Никнейм", "TG ID", "Данные для оплаты", "Ссылки на ролик"])
+    df = pd.DataFrame(rows, columns=["Никнейм", "ТГ айди", "Данные для оплаты", "Ссылка на ролик"])
     df.to_excel(PAYMENTS_EXPORT_XLSX, index=False)
 
 # ---------- HEALTHCHECK ----------
@@ -226,10 +245,10 @@ def start_health_server():
         def do_GET(self):
             self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
         def log_message(self, *_): pass
-    port = int(os.environ["PORT"])
+    port = int(os.environ.get("PORT", "10000"))
     srv = HTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    logging.info(f"Healthcheck server started on port {port} (from $PORT)")
+    logging.info(f"Healthcheck server started on :{port}")
 
 # ---------- ХЕНДЛЕРЫ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -250,7 +269,7 @@ async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_user_flow(context, str(update.effective_user.id))
     await update.message.reply_text("Перезапускаю сценарий. Начнём сначала 👇", reply_markup=menu_start(str(update.effective_user.id)))
 
-# Анкета
+# ----- Анкета -----
 async def ask_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("1. Укажите свой никнейм или название телеграм-канала:")
     return ASK_USERNAME
@@ -294,7 +313,7 @@ async def save_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-# ТЗ
+# ----- ТЗ -----
 async def send_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not user_filled_form(user_id):
@@ -311,11 +330,11 @@ async def send_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    # минимальная нагрузка по площадке
+    # платформа с минимальной нагрузкой
     counts = {p: sum(1 for x in orders.values() if x.get("platform") == p) for p in PLATFORMS}
     platform = min(counts, key=counts.get) if counts else PLATFORMS[0]
 
-    # даты: оформление = завтра; дедлайн = +3-4 дня
+    # даты: оформление = завтра; дедлайн = до +4 дней (на заказ/выкуп 3–4 дня)
     today = datetime.now().date()
     order_date = (today + timedelta(days=1)).strftime("%Y-%m-%d")
     deadline = (today + timedelta(days=4)).strftime("%Y-%m-%d")
@@ -329,17 +348,23 @@ async def send_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     save_data(data)
 
-    await update.message.reply_text(
+    text = (
         f"Ваша платформа: *{platform}*\n"
         f"Дата оформления заказа: *{order_date}*\n"
-        f"Дедлайн на оформление заказа: *до {deadline}*\n\n"
-        f"В ролике обязательно:\n"
-        f"• Упомяните бренд **Лас Играс**\n\n"
+        f"Дедлайн на оформление заказа (выкуп): *до {deadline}*\n\n"
+        f"❗ ТЗ:\n"
+        f"1) Закажите и выкупите товар по ключевому запросу *«Настольная игра»*.\n"
+        f"2) Оставьте отзыв с фото/видео на площадке *{platform}*.\n"
+        f"3) Снимите Reels-обзор в хорошем качестве с голосовой озвучкой: покажите товар и расскажите про игру.\n"
+        f"4) Через 5 дней после публикации пришлите статистику.\n"
+        f"5) *Возврат товара запрещён!* \n"
+        f"6) Оплата в течение *7 дней* после запроса оплаты.\n\n"
+        f"Во всём остальном — полная творческая свобода 🎥\n\n"
         f"Когда закончите — нажмите «✅ Задача выполнена» и пришлите ссылки.\n"
-        f"Если не получается — «❌ Отказываюсь от сотрудничества».",
-        parse_mode="Markdown",
-        reply_markup=menu_task_phase(user_id)
+        f"Если не получается — «❌ Отказываюсь от сотрудничества»."
     )
+
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=menu_task_phase(user_id))
 
 # Подтверждение выполнения — просим ссылки
 async def task_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -407,7 +432,7 @@ async def save_decline_reason(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def reconsider(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
-# Оплата — пользователь
+# ----- Оплата — пользователь -----
 async def ask_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not user_filled_form(user_id):
@@ -443,36 +468,38 @@ async def save_barcode_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    text = (update.message.text or "").strip()
+    pay_text = (update.message.text or "").strip()
 
     data = ensure_data_schema()
     payments = data["payments"]
     order = data["orders"].get(user_id, {})
     links = order.get("links", [])
 
-    payment_id = short_id(8)  # короткий id
+    payment_id = short_payment_id()
     payments[payment_id] = {
         "user_id": user_id,
         "order_photo": context.user_data.get("order_photo"),
         "barcode_photo": context.user_data.get("barcode_photo"),
-        "text": text,
+        "text": pay_text,
         "links": links,
         "timestamp": datetime.now().isoformat(),
-        "status": "pending"
+        "status": "pending",
+        "admin_msg_id": None,
     }
     save_data(data)
-    # авто-экспорт всех заявок в один XLSX
+
+    # === Авто-экспорт в единый Excel ===
     try:
-        export_payments_excel(data)
+        export_payments_excel()
     except Exception as e:
-        logging.exception("Авто-экспорт payments_export.xlsx не удался", exc_info=e)
+        logging.exception("Не удалось обновить payments_export.xlsx", exc_info=e)
 
     await update.message.reply_text(
-        f"✅ Заявка на оплату принята. Номер: {payment_id}. Деньги поступят в течение 2-х рабочих дней.",
+        f"✅ Заявка на оплату принята. Номер: {payment_id}. Деньги поступят в течение 7 дней.",
         reply_markup=menu_after_links(user_id)
     )
 
-    # ---- Админу: медиагруппа + одно сообщение с данными и кнопкой подтверждения ----
+    # ---- Админу: 2 фото (медиагруппа) + одно сообщение с инлайн-кнопкой ----
     app = context.application
     media = []
     if context.user_data.get("order_photo"):
@@ -485,22 +512,215 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.exception("send_media_group failed", exc_info=e)
 
+    # никнейм
+    bloggers = data.get("bloggers", {})
+    uname = bloggers.get(user_id, {}).get("username", "")
+
     links_text = "\n".join(f"- {u}" for u in links) if links else "—"
     admin_text = (
         f"💰 Заявка на оплату #{payment_id}\n"
-        f"👤 user_id: {user_id}\n"
+        f"👤 Ник: {uname}\n"
+        f"🆔 user_id: {user_id}\n"
         f"🔗 Ссылки:\n{links_text}\n\n"
-        f"💳 Данные для выплаты:\n{text}\n\n"
-        f"Чтобы закрыть заявку — нажмите кнопку ниже и пришлите чек."
+        f"💳 Данные для выплаты:\n{pay_text}\n\n"
+        f"Нажмите «Оплата произведена», затем пришлите чек — он уйдёт пользователю."
     )
-    confirm_btn = ReplyKeyboardMarkup([[KeyboardButton(f"✅ Оплата произведена: {payment_id}")],
-                                       [KeyboardButton("👑 Админ-меню")]], resize_keyboard=True)
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ Оплата произведена #{payment_id}", callback_data=f"pay_done:{payment_id}")]
+    ])
     try:
-        await app.bot.send_message(ADMIN_ID, admin_text, reply_markup=confirm_btn)
+        msg = await app.bot.send_message(ADMIN_ID, admin_text, reply_markup=kb)
+        data = ensure_data_schema()
+        data["payments"][payment_id]["admin_msg_id"] = msg.message_id
+        save_data(data)
     except Exception as e:
         logging.exception("send admin text failed", exc_info=e)
 
     return ConversationHandler.END
+
+# ----- Админ: клик по инлайн-кнопке «Оплата произведена #... » -----
+async def on_admin_pay_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != ADMIN_ID:
+        await update.callback_query.answer("Недостаточно прав", show_alert=True)
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        payment_id = query.data.split(":", 1)[1]
+    except Exception:
+        payment_id = None
+
+    if not payment_id:
+        await query.edit_message_text("Не распознал номер заявки. Повторите из админ-меню.")
+        return
+
+    # ждём чек по этой заявке от админа
+    context.bot_data.setdefault("await_receipt_by_admin", {})
+    context.bot_data["await_receipt_by_admin"][str(update.effective_user.id)] = payment_id
+
+    # визуально пометим сообщение
+    try:
+        await query.edit_message_reply_markup(
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"⏳ Ожидаю чек по #{payment_id}", callback_data=f"pay_done:{payment_id}")]
+            ])
+        )
+    except Exception:
+        pass
+
+    await query.message.reply_text(f"Пришлите фото чека для заявки #{payment_id}.")
+
+# --- Админ: приём чека и уведомление пользователя ---
+async def admin_wait_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wait_map = context.bot_data.get("await_receipt_by_admin", {})
+    payment_id = wait_map.get(str(update.effective_user.id))
+
+    if not payment_id:
+        await update.message.reply_text("Сначала нажмите кнопку в заявке («Оплата произведена …»), затем пришлите чек.", reply_markup=menu_admin)
+        return ConversationHandler.END
+
+    if not update.message.photo:
+        await update.message.reply_text("Это не фото. Пришлите фото чека.")
+        return ADMIN_WAITING_RECEIPT
+
+    photo_id = update.message.photo[-1].file_id
+
+    data = ensure_data_schema()
+    pay = data["payments"].get(payment_id)
+    if not pay:
+        await update.message.reply_text("Заявка не найдена.", reply_markup=menu_admin)
+        return ConversationHandler.END
+
+    user_id = pay["user_id"]
+
+    # Отправляем пользователю чек и сообщение
+    app = context.application
+    try:
+        await app.bot.send_message(user_id, f"✅ Оплата произведена по заявке #{payment_id}. Спасибо!")
+        await app.bot.send_photo(user_id, photo_id, caption="Чек об оплате")
+    except Exception as e:
+        logging.exception("Не удалось отправить чек пользователю", exc_info=e)
+
+    # Обновим статусы и экспорт
+    pay["status"] = "paid"
+    order = data["orders"].get(user_id, {})
+    order["status"] = "completed"
+    data["orders"][user_id] = order
+    save_data(data)
+
+    try:
+        export_payments_excel()
+    except Exception as e:
+        logging.exception("Не удалось обновить payments_export.xlsx при подтверждении оплаты", exc_info=e)
+
+    # Попробуем отредактировать исходное админское сообщение — убрать кнопку/пометить оплачено
+    admin_msg_id = pay.get("admin_msg_id")
+    if admin_msg_id:
+        try:
+            await app.bot.edit_message_reply_markup(chat_id=ADMIN_ID, message_id=admin_msg_id, reply_markup=None)
+            await app.bot.edit_message_text(
+                chat_id=ADMIN_ID, message_id=admin_msg_id,
+                text=f"✅ Оплачено\n\nЗаявка #{payment_id} закрыта."
+            )
+        except Exception:
+            pass
+
+    # очистим ожидание чеков
+    try:
+        del context.bot_data["await_receipt_by_admin"][str(update.effective_user.id)]
+    except Exception:
+        pass
+
+    await update.message.reply_text("Готово. Пользователь уведомлён и получил чек.", reply_markup=menu_admin)
+    return ConversationHandler.END
+
+# ----- Админ: статус по user_id -----
+async def admin_status_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отправьте user_id, по которому показать статус.")
+    return ADMIN_WAITING_STATUS_USER
+
+async def admin_status_wait_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = (update.message.text or "").strip()
+    data = ensure_data_schema()
+    if uid not in data["bloggers"] and uid not in data["orders"]:
+        await update.message.reply_text("Пользователь не найден.", reply_markup=menu_admin)
+        return ConversationHandler.END
+    await update.message.reply_text(format_user_status(uid, data), reply_markup=menu_admin)
+    return ConversationHandler.END
+
+# ----- Админ: рассылка (с предпросмотром и логом неуспешных) -----
+BROADCAST_PREVIEW_CB_YES = "broadcast:yes"
+BROADCAST_PREVIEW_CB_NO = "broadcast:no"
+
+async def admin_broadcast_ask_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Пришлите текст рассылки. Будет отправлен всем, кто активировал бота (заполнил анкету).")
+    return ADMIN_WAITING_BROADCAST_TEXT
+
+async def admin_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Текст пустой. Отменено.", reply_markup=menu_admin)
+        return ConversationHandler.END
+
+    # посчитаем получателей (по анкете)
+    data = ensure_data_schema()
+    bloggers = data.get("bloggers", {})
+    n = len(bloggers)
+
+    context.user_data["broadcast_text"] = text
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"✅ Да, отправить {n} пользователям", callback_data=BROADCAST_PREVIEW_CB_YES),
+            InlineKeyboardButton("❌ Отмена", callback_data=BROADCAST_PREVIEW_CB_NO),
+        ]
+    ])
+    preview = f"📣 Предпросмотр рассылки:\n\n{text}\n\nОтправить всем {n} пользователям?"
+    await update.message.reply_text(preview, reply_markup=kb)
+    return ConversationHandler.END
+
+async def on_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != ADMIN_ID:
+        await update.callback_query.answer("Недостаточно прав", show_alert=True)
+        return
+
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == BROADCAST_PREVIEW_CB_NO:
+        await q.edit_message_text("Рассылка отменена.", reply_markup=None)
+        return
+
+    # отправляем
+    text = context.user_data.get("broadcast_text", "")
+    data = ensure_data_schema()
+    bloggers = data.get("bloggers", {})
+    user_ids = list(bloggers.keys())
+
+    ok, fail = 0, 0
+    failed_ids: List[str] = []
+    app = context.application
+    for uid in user_ids:
+        try:
+            await app.bot.send_message(uid, text)
+            ok += 1
+        except Exception:
+            fail += 1
+            failed_ids.append(uid)
+
+    report = f"Рассылка завершена.\nУспешно: {ok}\nОшибок: {fail}"
+    if failed_ids:
+        report += "\n\nНе доставлено пользователям (user_id):\n" + "\n".join(failed_ids[:100])
+        if len(failed_ids) > 100:
+            report += f"\n...и ещё {len(failed_ids)-100}"
+
+    try:
+        await q.edit_message_text(report, reply_markup=None)
+    except Exception:
+        await app.bot.send_message(ADMIN_ID, report)
 
 # Связь с менеджером
 async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -525,22 +745,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "📤 Выгрузка в Excel":
             return await export_to_excel(update, context)
         if text == "📊 Статус по пользователю":
-            await update.message.reply_text("Отправьте user_id, по которому показать статус.")
-            return ADMIN_WAITING_STATUS_USER
+            return await admin_status_start(update, context)
         if text == "📣 Рассылка":
-            await update.message.reply_text("Пришлите текст рассылки. Он будет отправлен всем, кто активировал бота.")
-            return ADMIN_WAITING_BROADCAST
-        if text.startswith("✅ Оплата произведена:"):
-            try:
-                payment_id = text.split(":", 1)[1].strip()
-            except Exception:
-                payment_id = None
-            if not payment_id:
-                await update.message.reply_text("Не распознал номер заявки. Повторите.")
-                return ConversationHandler.END
-            context.chat_data["confirm_payment"] = {"payment_id": payment_id}
-            await update.message.reply_text("Прикрепите фото чека, пожалуйста.")
-            return ADMIN_WAITING_RECEIPT
+            return await admin_broadcast_ask_text(update, context)
         if text == "⬅️ Назад":
             await start(update, context); return
 
@@ -564,72 +771,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "📞 Связаться с менеджером":
         return await contact(update, context)
 
-# --- Админ: статус по user_id ---
-async def admin_status_wait_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = (update.message.text or "").strip()
-    data = ensure_data_schema()
-    if uid not in data["bloggers"] and uid not in data["orders"]:
-        await update.message.reply_text("Пользователь не найден.", reply_markup=menu_admin)
-        return ConversationHandler.END
-    await update.message.reply_text(format_user_status(uid, data), reply_markup=menu_admin)
-    return ConversationHandler.END
-
-# --- Админ: приём чека и уведомление пользователя ---
-async def admin_wait_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    info = context.chat_data.get("confirm_payment") or {}
-    payment_id = info.get("payment_id")
-    if not payment_id:
-        await update.message.reply_text("Нет выбранной заявки. Вернитесь в админ-меню.", reply_markup=menu_admin)
-        return ConversationHandler.END
-    if not update.message.photo:
-        await update.message.reply_text("Это не фото. Пришлите фото чека.")
-        return ADMIN_WAITING_RECEIPT
-
-    photo_id = update.message.photo[-1].file_id
-
-    data = ensure_data_schema()
-    pay = data["payments"].get(payment_id)
-    if not pay:
-        await update.message.reply_text("Заявка не найдена.", reply_markup=menu_admin)
-        return ConversationHandler.END
-
-    user_id = pay["user_id"]
-
-    app = context.application
-    try:
-        await app.bot.send_message(user_id, f"✅ Оплата произведена по заявке #{payment_id}. Спасибо!")
-        await app.bot.send_photo(user_id, photo_id, caption="Чек об оплате")
-    except Exception as e:
-        logging.exception("Не удалось отправить чек пользователю", exc_info=e)
-
-    pay["status"] = "paid"
-    order = data["orders"].get(user_id, {})
-    order["status"] = "completed"
-    data["orders"][user_id] = order
-    save_data(data)
-
-    await update.message.reply_text("Готово. Пользователь уведомлён и получил чек.", reply_markup=menu_admin)
-    context.chat_data.pop("confirm_payment", None)
-    return ConversationHandler.END
-
-# --- Админ: рассылка ---
-async def admin_broadcast_wait_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    data = ensure_data_schema()
-    bloggers = list(data.get("bloggers", {}).keys())
-
-    sent, fail = 0, 0
-    app = context.application
-    for uid in bloggers:
-        try:
-            await app.bot.send_message(uid, text)
-            sent += 1
-        except Exception:
-            fail += 1
-    await update.message.reply_text(f"Рассылка отправлена. Успешно: {sent}, ошибок: {fail}.", reply_markup=menu_admin)
-    return ConversationHandler.END
-
-# Экспорт (только админ)
+# Экспорт (только админ — общий экспорт всех таблиц)
 async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != ADMIN_ID:
         return
@@ -645,13 +787,14 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     payments_list = []
     for pid, pdata in data["payments"].items():
-        row = dict(pdata); row["payment_id"] = pid
+        row = dict(pdata)
+        row["payment_id"] = pid
         payments_list.append(row)
     payments_df = pd.DataFrame(payments_list)
     payments_df.to_excel(os.path.join(DATA_DIR, "payments.xlsx"), index=False)
 
     # Отказы
-    declines_rows = []
+    declines_rows: List[Dict[str, Any]] = []
     if os.path.exists(DECLINES_FILE):
         try:
             with open(DECLINES_FILE, "r", encoding="utf-8") as f:
@@ -663,13 +806,16 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     (pd.DataFrame(declines_rows) if declines_rows else pd.DataFrame(columns=["user_id", "reason", "timestamp"])) \
         .to_excel(os.path.join(DATA_DIR, "declines.xlsx"), index=False)
 
-    # и наш авто-реестр заявок в требуемом формате
+    # Единый экспорт заявок на оплату
     try:
-        export_payments_excel(data)
+        export_payments_excel()
     except Exception as e:
-        logging.exception("Экспорт payments_export.xlsx не удался", exc_info=e)
+        logging.exception("Не удалось обновить payments_export.xlsx из экспорта", exc_info=e)
 
-    await update.message.reply_text("Данные экспортированы: bloggers.xlsx, orders.xlsx, payments.xlsx, declines.xlsx, payments_export.xlsx", reply_markup=menu_admin)
+    await update.message.reply_text(
+        "Данные экспортированы: bloggers.xlsx, orders.xlsx, payments.xlsx, declines.xlsx, payments_export.xlsx",
+        reply_markup=menu_admin
+    )
 
 # ---------- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ----------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -730,26 +876,30 @@ if __name__ == "__main__":
         fallbacks=[],
     )
 
-    # Админ: статус по пользователю
+    # Админ: статус по пользователю (ввод user_id после нажатия кнопки)
     admin_status_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^📊 Статус по пользователю$"), lambda u,c: ADMIN_WAITING_STATUS_USER)],
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^📊 Статус по пользователю$"), admin_status_start)],
         states={ADMIN_WAITING_STATUS_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_status_wait_uid)]},
         fallbacks=[],
     )
 
-    # Админ: приём чека
+    # Админ: ожидание чека после нажатия inline-кнопки
     admin_receipt_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^✅ Оплата произведена:"), handle_text)],
+        entry_points=[MessageHandler(filters.PHOTO & filters.User(user_id=int(ADMIN_ID)), admin_wait_receipt)],
         states={ADMIN_WAITING_RECEIPT: [MessageHandler(filters.PHOTO, admin_wait_receipt)]},
         fallbacks=[],
     )
 
-    # Админ: рассылка
+    # Админ: рассылка (ввод текста -> предпросмотр -> подтверждение)
     admin_broadcast_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^📣 Рассылка$"), lambda u,c: ADMIN_WAITING_BROADCAST)],
-        states={ADMIN_WAITING_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_wait_text)]},
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^📣 Рассылка$"), admin_broadcast_ask_text)],
+        states={ADMIN_WAITING_BROADCAST_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_text)]},
         fallbacks=[],
     )
+
+    # Callback’и
+    app.add_handler(CallbackQueryHandler(on_admin_pay_done_callback, pattern=r"^pay_done:"))
+    app.add_handler(CallbackQueryHandler(on_broadcast_confirm, pattern=r"^broadcast:(yes|no)$"))
 
     # Прочие кнопки
     reconsider_handler = MessageHandler(filters.TEXT & filters.Regex("Я передумал\\(-а\\)"), reconsider)
