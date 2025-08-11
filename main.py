@@ -44,11 +44,13 @@ if not BOT_TOKEN:
     WAITING_DECLINE_REASON,
     ADMIN_WAITING_STATUS_USER,
     ADMIN_WAITING_RECEIPT,
-) = range(12)
+    ADMIN_WAITING_BROADCAST,
+) = range(13)
 
 DATA_DIR = "data"
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 DECLINES_FILE = os.path.join(DATA_DIR, "declines.json")
+PAYMENTS_EXPORT_XLSX = os.path.join(DATA_DIR, "payments_export.xlsx")
 ADMIN_ID = "1080067724"
 
 # Только эти площадки
@@ -56,7 +58,6 @@ PLATFORMS = ["Wildberries", "Ozon"]
 
 # ---------- МЕНЮ ----------
 def with_admin(menu: ReplyKeyboardMarkup, uid: str) -> ReplyKeyboardMarkup:
-    # Возвращаем меню с добавленной строкой админа (только для ADMIN_ID)
     if uid == ADMIN_ID:
         rows = [list(map(lambda b: KeyboardButton(b.text), row)) for row in menu.keyboard]
         rows.append([KeyboardButton("👑 Админ-меню")])
@@ -91,6 +92,7 @@ menu_after_decline_base = ReplyKeyboardMarkup([
 
 menu_admin = ReplyKeyboardMarkup([
     [KeyboardButton("📊 Статус по пользователю"), KeyboardButton("📤 Выгрузка в Excel")],
+    [KeyboardButton("📣 Рассылка")],
     [KeyboardButton("⬅️ Назад")],
 ], resize_keyboard=True)
 
@@ -142,7 +144,7 @@ def append_decline(user_id: str, reason: str):
     with open(DECLINES_FILE, "w", encoding="utf-8") as f:
         json.dump(items, f, ensure_ascii=False, indent=2)
 
-# ---------- УТИЛИТЫ ДЛЯ СЦЕНАРИЯ ----------
+# ---------- УТИЛИТЫ ----------
 def user_filled_form(user_id: str) -> bool:
     data = ensure_data_schema()
     return user_id in data["bloggers"]
@@ -164,6 +166,10 @@ def set_order_links_received(user_id: str, links: list[str]):
 
 def reset_user_flow(context: ContextTypes.DEFAULT_TYPE, user_id: str):
     context.user_data.clear()
+
+def short_id(n: int = 8) -> str:
+    # короткий ID платежа
+    return uuid.uuid4().hex[:n]
 
 def format_user_status(user_id: str, data: dict) -> str:
     u = data["bloggers"].get(user_id, {})
@@ -189,6 +195,41 @@ def format_user_status(user_id: str, data: dict) -> str:
         for i, l in enumerate(links, 1):
             lines.append(f"   {i}. {l}")
     return "\n".join(lines)
+
+def export_payments_excel(data: dict):
+    """Автоматический экспорт всех заявок в один XLSX (payments_export.xlsx)."""
+    rows = []
+    bloggers = data.get("bloggers", {})
+    payments = data.get("payments", {})
+
+    for pid, p in payments.items():
+        uid = p.get("user_id", "")
+        user = bloggers.get(uid, {})
+        nickname = user.get("username", "")
+        paytext = p.get("text", "")
+        links = p.get("links", []) or []
+        links_joined = "\n".join(links) if isinstance(links, list) else str(links)
+
+        rows.append({
+            "Никнейм": nickname,
+            "TG ID": uid,
+            "Данные для оплаты": paytext,
+            "Ссылки на ролик": links_joined,
+        })
+
+    df = pd.DataFrame(rows, columns=["Никнейм", "TG ID", "Данные для оплаты", "Ссылки на ролик"])
+    df.to_excel(PAYMENTS_EXPORT_XLSX, index=False)
+
+# ---------- HEALTHCHECK ----------
+def start_health_server():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+        def log_message(self, *_): pass
+    port = int(os.environ["PORT"])
+    srv = HTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    logging.info(f"Healthcheck server started on port {port} (from $PORT)")
 
 # ---------- ХЕНДЛЕРЫ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,14 +311,14 @@ async def send_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    # платформа с минимальной нагрузкой
+    # минимальная нагрузка по площадке
     counts = {p: sum(1 for x in orders.values() if x.get("platform") == p) for p in PLATFORMS}
     platform = min(counts, key=counts.get) if counts else PLATFORMS[0]
 
-    # даты: оформление = завтра; дедлайн = +3 дня
+    # даты: оформление = завтра; дедлайн = +3-4 дня
     today = datetime.now().date()
     order_date = (today + timedelta(days=1)).strftime("%Y-%m-%d")
-    deadline = (today + timedelta(days=4)).strftime("%Y-%m-%d")  # 3-4 дня на оформление
+    deadline = (today + timedelta(days=4)).strftime("%Y-%m-%d")
 
     orders[user_id] = {
         "platform": platform,
@@ -409,7 +450,7 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order = data["orders"].get(user_id, {})
     links = order.get("links", [])
 
-    payment_id = str(uuid.uuid4())
+    payment_id = short_id(8)  # короткий id
     payments[payment_id] = {
         "user_id": user_id,
         "order_photo": context.user_data.get("order_photo"),
@@ -420,19 +461,23 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "status": "pending"
     }
     save_data(data)
+    # авто-экспорт всех заявок в один XLSX
+    try:
+        export_payments_excel(data)
+    except Exception as e:
+        logging.exception("Авто-экспорт payments_export.xlsx не удался", exc_info=e)
 
     await update.message.reply_text(
         f"✅ Заявка на оплату принята. Номер: {payment_id}. Деньги поступят в течение 2-х рабочих дней.",
         reply_markup=menu_after_links(user_id)
     )
 
-    # ---- Уведомление админу: медиагруппа + одно сообщение с данными и кнопкой подтверждения ----
+    # ---- Админу: медиагруппа + одно сообщение с данными и кнопкой подтверждения ----
     app = context.application
     media = []
     if context.user_data.get("order_photo"):
         media.append(InputMediaPhoto(media=context.user_data["order_photo"], caption=f"Заявка на оплату #{payment_id}"))
     if context.user_data.get("barcode_photo"):
-        # подпись только у первого элемента медиа-группы
         media.append(InputMediaPhoto(media=context.user_data["barcode_photo"]))
     if media:
         try:
@@ -460,7 +505,6 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Связь с менеджером
 async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    # Показываем меню под текущую стадию
     if order_status(uid) == "links_received":
         kb = menu_after_links(uid)
     elif user_has_order(uid):
@@ -483,8 +527,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "📊 Статус по пользователю":
             await update.message.reply_text("Отправьте user_id, по которому показать статус.")
             return ADMIN_WAITING_STATUS_USER
+        if text == "📣 Рассылка":
+            await update.message.reply_text("Пришлите текст рассылки. Он будет отправлен всем, кто активировал бота.")
+            return ADMIN_WAITING_BROADCAST
         if text.startswith("✅ Оплата произведена:"):
-            # Парсим payment_id и ждём чек
             try:
                 payment_id = text.split(":", 1)[1].strip()
             except Exception:
@@ -549,7 +595,6 @@ async def admin_wait_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     user_id = pay["user_id"]
 
-    # Отправляем пользователю чек и сообщение
     app = context.application
     try:
         await app.bot.send_message(user_id, f"✅ Оплата произведена по заявке #{payment_id}. Спасибо!")
@@ -557,7 +602,6 @@ async def admin_wait_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logging.exception("Не удалось отправить чек пользователю", exc_info=e)
 
-    # Обновим статусы
     pay["status"] = "paid"
     order = data["orders"].get(user_id, {})
     order["status"] = "completed"
@@ -566,6 +610,23 @@ async def admin_wait_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text("Готово. Пользователь уведомлён и получил чек.", reply_markup=menu_admin)
     context.chat_data.pop("confirm_payment", None)
+    return ConversationHandler.END
+
+# --- Админ: рассылка ---
+async def admin_broadcast_wait_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    data = ensure_data_schema()
+    bloggers = list(data.get("bloggers", {}).keys())
+
+    sent, fail = 0, 0
+    app = context.application
+    for uid in bloggers:
+        try:
+            await app.bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            fail += 1
+    await update.message.reply_text(f"Рассылка отправлена. Успешно: {sent}, ошибок: {fail}.", reply_markup=menu_admin)
     return ConversationHandler.END
 
 # Экспорт (только админ)
@@ -584,8 +645,7 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     payments_list = []
     for pid, pdata in data["payments"].items():
-        row = dict(pdata)
-        row["payment_id"] = pid
+        row = dict(pdata); row["payment_id"] = pid
         payments_list.append(row)
     payments_df = pd.DataFrame(payments_list)
     payments_df.to_excel(os.path.join(DATA_DIR, "payments.xlsx"), index=False)
@@ -603,18 +663,13 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     (pd.DataFrame(declines_rows) if declines_rows else pd.DataFrame(columns=["user_id", "reason", "timestamp"])) \
         .to_excel(os.path.join(DATA_DIR, "declines.xlsx"), index=False)
 
-    await update.message.reply_text("Данные экспортированы: bloggers.xlsx, orders.xlsx, payments.xlsx, declines.xlsx", reply_markup=menu_admin)
+    # и наш авто-реестр заявок в требуемом формате
+    try:
+        export_payments_excel(data)
+    except Exception as e:
+        logging.exception("Экспорт payments_export.xlsx не удался", exc_info=e)
 
-# ---------- HEALTHCHECK ----------
-def start_health_server():
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
-        def log_message(self, *_): pass
-    port = int(os.environ.get("PORT", 8080))
-    srv = HTTPServer(("0.0.0.0", port), Handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    logging.info(f"Healthcheck server started on :{port}")
+    await update.message.reply_text("Данные экспортированы: bloggers.xlsx, orders.xlsx, payments.xlsx, declines.xlsx, payments_export.xlsx", reply_markup=menu_admin)
 
 # ---------- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ----------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -682,10 +737,17 @@ if __name__ == "__main__":
         fallbacks=[],
     )
 
-    # Админ: ожидание чека
+    # Админ: приём чека
     admin_receipt_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^✅ Оплата произведена:"), handle_text)],
         states={ADMIN_WAITING_RECEIPT: [MessageHandler(filters.PHOTO, admin_wait_receipt)]},
+        fallbacks=[],
+    )
+
+    # Админ: рассылка
+    admin_broadcast_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^📣 Рассылка$"), lambda u,c: ADMIN_WAITING_BROADCAST)],
+        states={ADMIN_WAITING_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_wait_text)]},
         fallbacks=[],
     )
 
@@ -703,6 +765,7 @@ if __name__ == "__main__":
     app.add_handler(decline_handler)
     app.add_handler(admin_status_handler)
     app.add_handler(admin_receipt_handler)
+    app.add_handler(admin_broadcast_handler)
     app.add_handler(reconsider_handler)
     app.add_handler(launch_handler)
     app.add_handler(restart_handler)
