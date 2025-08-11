@@ -1,8 +1,15 @@
-import logging
-import json
 import os
+import sys
+import json
+import uuid
+import asyncio
+import logging
 from datetime import datetime, timedelta
+
 from dotenv import load_dotenv
+from aiohttp import web
+import pandas as pd
+import telegram
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     ApplicationBuilder,
@@ -10,51 +17,51 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ContextTypes,
-    ConversationHandler
+    ConversationHandler,
 )
-import uuid
-import pandas as pd
-import telegram, sys, logging
+
+# ---------- ЛОГИ И ВЕРСИИ ----------
+logging.basicConfig(level=logging.INFO)
 logging.info(f"PTB_RUNTIME {telegram.__version__} | PY_RUNTIME {sys.version}")
 
-
+# ---------- ENV ----------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# логи
-logging.basicConfig(level=logging.INFO)
+if not BOT_TOKEN:
+    logging.error("BOT_TOKEN не найден в переменных окружения!")
+    # не выходим — чтобы было видно логи на Render, но бот не запустится без токена
 
-# состояния
-(ASK_USERNAME, ASK_SUBS, ASK_PLATFORMS, ASK_THEME, ASK_STATS, WAITING_PAYMENT, WAITING_ORDER_PHOTO, WAITING_BARCODE_PHOTO, WAITING_PAYMENT_TEXT) = range(9)
+# ---------- КОНСТАНТЫ ----------
+(ASK_USERNAME, ASK_SUBS, ASK_PLATFORMS, ASK_THEME, ASK_STATS,
+ WAITING_PAYMENT, WAITING_ORDER_PHOTO, WAITING_BARCODE_PHOTO, WAITING_PAYMENT_TEXT) = range(9)
 
-# пути
-DATA_FILE = "data/data.json"
+DATA_DIR = "data"
+DATA_FILE = os.path.join(DATA_DIR, "data.json")
 
-# площадки
 PLATFORMS = ["Wildberries", "Ozon", "Sima-Land"]
 
-# меню
 main_menu = ReplyKeyboardMarkup([
     [KeyboardButton("📋 Заполнить анкету")],
     [KeyboardButton("📝 Получить ТЗ"), KeyboardButton("💸 Отправить на оплату")],
     [KeyboardButton("📞 Связаться с менеджером")]
 ], resize_keyboard=True)
 
-# Создание файла хранения
+# ---------- ПОДГОТОВКА ХРАНИЛИЩА ----------
+os.makedirs(DATA_DIR, exist_ok=True)
 if not os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "w") as f:
-        json.dump({"bloggers": {}, "orders": {}, "payments": {}}, f)
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump({"bloggers": {}, "orders": {}, "payments": {}}, f, ensure_ascii=False, indent=2)
 
-# Загрузка/сохранение данных
 def load_data():
-    with open(DATA_FILE, "r") as f:
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-# Приветствие
+# ---------- ХЕНДЛЕРЫ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Мы рады сотрудничеству с вами 🎉\n"
@@ -62,7 +69,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu
     )
 
-#Анкета
+# Анкета
 async def ask_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("1. Укажите свой никнейм или название телеграм-канала:")
     return ASK_USERNAME
@@ -89,10 +96,8 @@ async def save_theme(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def save_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]
-    file_id = photo.file_id
-    context.user_data["reach_screenshot"] = file_id
+    context.user_data["reach_screenshot"] = photo.file_id
 
-    # Сохраняем
     data = load_data()
     data["bloggers"][str(update.effective_user.id)] = context.user_data
     save_data(data)
@@ -110,15 +115,13 @@ async def send_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         platform = orders[user_id]["platform"]
         order_date = orders[user_id]["order_date"]
     else:
-        # Распределяем платформу
         counts = {p: sum(1 for x in orders.values() if x["platform"] == p) for p in PLATFORMS}
         platform = min(counts, key=counts.get)
 
-        # Дата заказа
-        start = datetime(2025, 9, 1)
+        start_dt = datetime(2025, 9, 1)
         total = sum(counts.values())
         week = (total // 333) + 1
-        order_date = start + timedelta(weeks=min(2, week))
+        order_date = start_dt + timedelta(weeks=min(2, week))
 
         orders[user_id] = {
             "platform": platform,
@@ -136,8 +139,7 @@ async def send_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-#Оплата
-#скриншот заказа
+# Оплата
 async def ask_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     data = load_data()
@@ -147,21 +149,18 @@ async def ask_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("1️⃣ Пришлите скриншот заказа:")
     return WAITING_ORDER_PHOTO
 
-# сохраняем скриншот заказа
 async def save_order_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]
     context.user_data["order_photo"] = photo.file_id
     await update.message.reply_text("2️⃣ Теперь пришлите фото разрезанного штрихкода на упаковке:")
     return WAITING_BARCODE_PHOTO
 
-# сохраняем штрихкод
 async def save_barcode_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]
     context.user_data["barcode_photo"] = photo.file_id
     await update.message.reply_text("3️⃣ Теперь напишите номер карты и ФИО держателя текстом:")
     return WAITING_PAYMENT_TEXT
 
-# сохраняем текст и отправляем Паше (пока мне)
 async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     text = update.message.text
@@ -169,36 +168,36 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     payments = data["payments"]
 
-    # Генерируем уникальный ID для платежа
     payment_id = str(uuid.uuid4())
 
     payments[payment_id] = {
         "user_id": user_id,
-        "order_photo": context.user_data["order_photo"],
-        "barcode_photo": context.user_data["barcode_photo"],
+        "order_photo": context.user_data.get("order_photo"),
+        "barcode_photo": context.user_data.get("barcode_photo"),
         "text": text,
         "timestamp": datetime.now().isoformat()
     }
     save_data(data)
 
-    await update.message.reply_text(f"✅ Заявка на оплату принята. Ваш уникальный номер заявки: {payment_id}. Деньги поступят в течение 2-х рабочих дней.")
+    await update.message.reply_text(
+        f"✅ Заявка на оплату принята. Ваш уникальный номер заявки: {payment_id}. "
+        "Деньги поступят в течение 2-х рабочих дней."
+    )
 
-    # Уведомление Паше
     ADMIN_ID = "1080067724"
     app = context.application
-
     await app.bot.send_message(ADMIN_ID, f"💰 Заявка на оплату от {user_id} (Номер: {payment_id})")
-    await app.bot.send_photo(ADMIN_ID, context.user_data["order_photo"], caption="Скриншот заказа")
-    await app.bot.send_photo(ADMIN_ID, context.user_data["barcode_photo"], caption="Штрихкод упаковки")
+    if context.user_data.get("order_photo"):
+        await app.bot.send_photo(ADMIN_ID, context.user_data["order_photo"], caption="Скриншот заказа")
+    if context.user_data.get("barcode_photo"):
+        await app.bot.send_photo(ADMIN_ID, context.user_data["barcode_photo"], caption="Штрихкод упаковки")
     await app.bot.send_message(ADMIN_ID, f"💳 {text}")
 
     return ConversationHandler.END
 
-# написать менеджеру
 async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("По вопросам пишите: @billyinemalo1")
 
-# Обработка кнопок
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == "📋 Заполнить анкету":
@@ -210,34 +209,47 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📞 Связаться с менеджером":
         return await contact(update, context)
 
-# Экспорт в эксель
 async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != "1080067724":  
+    if str(update.effective_user.id) != "1080067724":
         return
     data = load_data()
 
-    # Bloggers
-    bloggers_df = pd.DataFrame.from_dict(data["bloggers"], orient='index')
-    bloggers_df.index.name = 'user_id'
-    bloggers_df.to_excel("data/bloggers.xlsx")
+    bloggers_df = pd.DataFrame.from_dict(data["bloggers"], orient="index")
+    bloggers_df.index.name = "user_id"
+    bloggers_df.to_excel(os.path.join(DATA_DIR, "bloggers.xlsx"))
 
-    # Orders
-    orders_df = pd.DataFrame.from_dict(data["orders"], orient='index')
-    orders_df.index.name = 'user_id'
-    orders_df.to_excel("data/orders.xlsx")
+    orders_df = pd.DataFrame.from_dict(data["orders"], orient="index")
+    orders_df.index.name = "user_id"
+    orders_df.to_excel(os.path.join(DATA_DIR, "orders.xlsx"))
 
-    # Payments
     payments_list = []
     for payment_id, payment_data in data["payments"].items():
-        payment_data['payment_id'] = payment_id
-        payments_list.append(payment_data)
+        pdict = dict(payment_data)
+        pdict["payment_id"] = payment_id
+        payments_list.append(pdict)
     payments_df = pd.DataFrame(payments_list)
-    payments_df.to_excel("data/payments.xlsx", index=False)
+    payments_df.to_excel(os.path.join(DATA_DIR, "payments.xlsx"), index=False)
 
-    await update.message.reply_text("Данные экспортированы в Excel файлы: bloggers.xlsx, orders.xlsx, payments.xlsx")
+    await update.message.reply_text(
+        "Данные экспортированы в Excel файлы: bloggers.xlsx, orders.xlsx, payments.xlsx"
+    )
 
-# Инициализация
-def main():
+# ---------- HTTP + BOT RUNNER ----------
+async def health(request):
+    return web.Response(text="ok")
+
+async def runner():
+    # HTTP healthcheck для Render
+    port = int(os.environ.get("PORT", 8080))
+    web_app = web.Application()
+    web_app.add_routes([web.get("/", health), web.get("/healthz", health)])
+    app_runner = web.AppRunner(web_app)
+    await app_runner.setup()
+    site = web.TCPSite(app_runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Healthcheck server started on :{port}")
+
+    # Telegram bot (PTB 20.7)
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Анкета
@@ -255,52 +267,6 @@ def main():
 
     # Оплата
     payment_handler = ConversationHandler(
-    entry_points=[MessageHandler(filters.TEXT & filters.Regex("Отправить на оплату"), ask_payment)],
-    states={
-        WAITING_ORDER_PHOTO: [MessageHandler(filters.PHOTO, save_order_photo)],
-        WAITING_BARCODE_PHOTO: [MessageHandler(filters.PHOTO, save_barcode_photo)],
-        WAITING_PAYMENT_TEXT: [MessageHandler(filters.TEXT, save_payment_text)],
-    },
-    fallbacks=[],
-)
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("export", export_to_excel))
-    app.add_handler(form_handler)
-    app.add_handler(payment_handler)
-    app.add_handler(MessageHandler(filters.TEXT, handle_text))
-
-async def health(request):
-    return web.Response(text="ok")
-
-async def runner():
-    # --- HTTP-сервер для Render (healthcheck) ---
-    port = int(os.environ.get("PORT", 8080))
-    web_app = web.Application()
-    web_app.add_routes([web.get("/", health), web.get("/healthz", health)])
-    app_runner = web.AppRunner(web_app)
-    await app_runner.setup()
-    site = web.TCPSite(app_runner, "0.0.0.0", port)
-    await site.start()
-
-    # --- Telegram bot (PTB 20.7) ---
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # Регистрируем все твои хендлеры (как у тебя выше)
-    # ВАЖНО: эти 4 строки ниже — копируют то, что у тебя в main()
-    # (оставь их как есть, если выше уже объявлены функции-хендлеры)
-    form_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("Заполнить анкету"), ask_username)],
-        states={
-            ASK_USERNAME: [MessageHandler(filters.TEXT, save_username)],
-            ASK_SUBS: [MessageHandler(filters.TEXT, save_subs)],
-            ASK_PLATFORMS: [MessageHandler(filters.TEXT, save_platforms)],
-            ASK_THEME: [MessageHandler(filters.TEXT, save_theme)],
-            ASK_STATS: [MessageHandler(filters.PHOTO, save_stats)],
-        },
-        fallbacks=[],
-    )
-    payment_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("Отправить на оплату"), ask_payment)],
         states={
             WAITING_ORDER_PHOTO: [MessageHandler(filters.PHOTO, save_order_photo)],
@@ -309,26 +275,24 @@ async def runner():
         },
         fallbacks=[],
     )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("export", export_to_excel))
     app.add_handler(form_handler)
     app.add_handler(payment_handler)
     app.add_handler(MessageHandler(filters.TEXT, handle_text))
 
-    # Запускаем PTB в async-режиме рядом с HTTP
+    # Запуск PTB рядом с HTTP
     await app.initialize()
     await app.start()
-    # На всякий случай уберём вебхук (если был) и начнём polling
     await app.bot.delete_webhook(drop_pending_updates=True)
     await app.updater.start_polling()
+    logging.info("Bot polling started")
     await app.updater.wait_until_shutdown()
 
-    # Корректная остановка
     await app.stop()
     await app.shutdown()
+    logging.info("Bot stopped")
 
 if __name__ == "__main__":
     asyncio.run(runner())
-
-
-
