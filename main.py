@@ -14,6 +14,9 @@ from telegram.ext import (
 )
 import uuid
 import pandas as pd
+import telegram, sys, logging
+logging.info(f"PTB_RUNTIME {telegram.__version__} | PY_RUNTIME {sys.version}")
+
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -271,4 +274,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
