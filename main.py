@@ -21,16 +21,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 # логи
 logging.basicConfig(level=logging.INFO)
 
-# Состояния
+# состояния
 (ASK_USERNAME, ASK_SUBS, ASK_PLATFORMS, ASK_THEME, ASK_STATS, WAITING_PAYMENT, WAITING_ORDER_PHOTO, WAITING_BARCODE_PHOTO, WAITING_PAYMENT_TEXT) = range(9)
 
-# Пути
+# пути
 DATA_FILE = "data/data.json"
 
-# Площадки
+# площадки
 PLATFORMS = ["Wildberries", "Ozon", "Sima-Land"]
 
-# Начальное меню
+# меню
 main_menu = ReplyKeyboardMarkup([
     [KeyboardButton("📋 Заполнить анкету")],
     [KeyboardButton("📝 Получить ТЗ"), KeyboardButton("💸 Отправить на оплату")],
@@ -144,21 +144,21 @@ async def ask_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("1️⃣ Пришлите скриншот заказа:")
     return WAITING_ORDER_PHOTO
 
-#Сохраняем скриншот заказа
+# сохраняем скриншот заказа
 async def save_order_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]
     context.user_data["order_photo"] = photo.file_id
     await update.message.reply_text("2️⃣ Теперь пришлите фото разрезанного штрихкода на упаковке:")
     return WAITING_BARCODE_PHOTO
 
-#Сохраняем штрихкод
+# сохраняем штрихкод
 async def save_barcode_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]
     context.user_data["barcode_photo"] = photo.file_id
     await update.message.reply_text("3️⃣ Теперь напишите номер карты и ФИО держателя текстом:")
     return WAITING_PAYMENT_TEXT
 
-#Сохраняем текст и отправляем Паше
+# сохраняем текст и отправляем Паше (пока мне)
 async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     text = update.message.text
@@ -191,7 +191,7 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
-#Связь
+# написать менеджеру
 async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("По вопросам пишите: @billyinemalo1")
 
@@ -207,9 +207,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📞 Связаться с менеджером":
         return await contact(update, context)
 
-# Экспорт в Excel (для админа)
+# Экспорт в эксель
 async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != "1080067724":  # Только для админа
+    if str(update.effective_user.id) != "1080067724":  
         return
     data = load_data()
 
@@ -271,3 +271,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
