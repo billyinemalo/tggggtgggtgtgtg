@@ -20,57 +20,64 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-#ЛОГИ И ВЕРСИИ
+# ---------- ЛОГИ И ВЕРСИИ ----------
 logging.basicConfig(level=logging.INFO)
 logging.info(f"PTB_RUNTIME {telegram.__version__} | PY_RUNTIME {sys.version}")
 
-#ENV
+# ---------- ENV ----------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     logging.error("BOT_TOKEN не найден в переменных окружения!")
 
-#КОНСТАНТЫ И ПУТИ
+# ---------- КОНСТАНТЫ И ПУТИ ----------
 (
     ASK_USERNAME,
     ASK_SUBS,
     ASK_PLATFORMS,
     ASK_THEME,
     ASK_STATS,
-    WAITING_PAYMENT,
     WAITING_ORDER_PHOTO,
     WAITING_BARCODE_PHOTO,
     WAITING_PAYMENT_TEXT,
-    WAITING_LINKS,             #ожидание ссылок на ролик
-    WAITING_DECLINE_REASON     #ожидание причины отказа
-) = range(11)
+    WAITING_LINKS,
+    WAITING_DECLINE_REASON
+) = range(10)
 
 DATA_DIR = "data"
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
-DECLINES_FILE = os.path.join(DATA_DIR, "declines.json")  #отдельный файл для отказов
+DECLINES_FILE = os.path.join(DATA_DIR, "declines.json")
+ADMIN_ID = "1080067724"
 
 PLATFORMS = ["Wildberries", "Ozon", "Sima-Land"]
 
-# Меню до подтверждения выполнения (без оплаты)
-menu_before_payment = ReplyKeyboardMarkup([
+# Меню: старт/до ТЗ
+menu_start = ReplyKeyboardMarkup([
     [KeyboardButton("📋 Заполнить анкету")],
     [KeyboardButton("📝 Получить ТЗ")],
-    [KeyboardButton("✅ Задача выполнена"), KeyboardButton("❌ Отказываюсь от сотрудничества")],
-    [KeyboardButton("📞 Связаться с менеджером")]
+    [KeyboardButton("📞 Связаться с менеджером")],
 ], resize_keyboard=True)
 
-# Меню после получения ссылок (с оплатой)
-menu_after_payment = ReplyKeyboardMarkup([
-    [KeyboardButton("📋 Заполнить анкету")],
-    [KeyboardButton("📝 Получить ТЗ")],
+# Меню после ТЗ (только три кнопки)
+menu_task_phase = ReplyKeyboardMarkup([
     [KeyboardButton("✅ Задача выполнена"), KeyboardButton("❌ Отказываюсь от сотрудничества")],
+    [KeyboardButton("📞 Связаться с менеджером")],
+], resize_keyboard=True)
+
+# Меню после получения ссылок (добавляется оплата)
+menu_after_links = ReplyKeyboardMarkup([
     [KeyboardButton("💸 Отправить на оплату")],
-    [KeyboardButton("📞 Связаться с менеджером")]
+    [KeyboardButton("📞 Связаться с менеджером")],
+], resize_keyboard=True)
+
+# Меню после отказа (кнопка перезапуска)
+menu_after_decline = ReplyKeyboardMarkup([
+    [KeyboardButton("🔁 Я передумал(-а)")],
+    [KeyboardButton("📞 Связаться с менеджером")],
 ], resize_keyboard=True)
 
 # ---------- ПОДГОТОВКА ХРАНИЛИЩА ----------
 os.makedirs(DATA_DIR, exist_ok=True)
-
 DEFAULT_DATA = {"bloggers": {}, "orders": {}, "payments": {}}
 
 def load_data():
@@ -85,8 +92,6 @@ def save_data(data: dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def ensure_data_schema() -> dict:
-    """Гарантирует корректную структуру data.json и наличие словарей bloggers/orders/payments."""
-    os.makedirs(DATA_DIR, exist_ok=True)
     try:
         data = load_data()
     except Exception:
@@ -101,7 +106,6 @@ def ensure_data_schema() -> dict:
     return data
 
 def append_decline(user_id: str, reason: str):
-    """Логируем причины отказов в отдельный файл."""
     items = []
     if os.path.exists(DECLINES_FILE):
         try:
@@ -111,21 +115,43 @@ def append_decline(user_id: str, reason: str):
                     items = []
         except Exception:
             items = []
-    items.append({
-        "user_id": user_id,
-        "reason": reason,
-        "timestamp": datetime.now().isoformat()
-    })
+    items.append({"user_id": user_id, "reason": reason, "timestamp": datetime.now().isoformat()})
     with open(DECLINES_FILE, "w", encoding="utf-8") as f:
         json.dump(items, f, ensure_ascii=False, indent=2)
 
+# ---------- УТИЛИТЫ ДЛЯ СЦЕНАРИЯ ----------
+def user_filled_form(user_id: str) -> bool:
+    data = ensure_data_schema()
+    return user_id in data["bloggers"]
+
+def user_has_order(user_id: str) -> bool:
+    data = ensure_data_schema()
+    return user_id in data["orders"]
+
+def order_status(user_id: str) -> str | None:
+    data = ensure_data_schema()
+    return data["orders"].get(user_id, {}).get("status")
+
+def set_order_links_received(user_id: str, links: list[str]):
+    data = ensure_data_schema()
+    o = data["orders"].setdefault(user_id, {"platform": None, "order_date": None, "status": "assigned", "links": []})
+    o["links"] = o.get("links", []) + links
+    o["status"] = "links_received"
+    save_data(data)
+
+def guess_menu_for_user(user_id: str):
+    if order_status(user_id) == "links_received":
+        return menu_after_links
+    if user_has_order(user_id):
+        return menu_task_phase
+    return menu_start
+
 # ---------- ХЕНДЛЕРЫ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Старт: всегда показываем кнопки со связью с менеджером."""
     await update.message.reply_text(
         "Привет! Мы рады сотрудничеству с вами 🎉\n"
         "Пожалуйста, заполните анкету, чтобы мы могли начать работу.",
-        reply_markup=menu_before_payment
+        reply_markup=menu_start
     )
 
 # Анкета
@@ -162,130 +188,174 @@ async def save_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["reach_screenshot"] = photo.file_id
 
     data = ensure_data_schema()
-    data["bloggers"][str(update.effective_user.id)] = dict(context.user_data)
+    user_id = str(update.effective_user.id)
+    bloggers = data["bloggers"]
+    bloggers[user_id] = dict(context.user_data)
     save_data(data)
 
-    await update.message.reply_text("Спасибо! Ваша анкета принята ✅", reply_markup=menu_before_payment)
+    await update.message.reply_text(
+        "Спасибо! Ваша анкета принята ✅\nТеперь запросите ТЗ кнопкой «📝 Получить ТЗ».",
+        reply_markup=menu_start
+    )
     return ConversationHandler.END
 
 # ТЗ
 async def send_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+
+    # защита сценария: ТЗ без анкеты
+    if not user_filled_form(user_id):
+        await update.message.reply_text(
+            "Сначала заполните анкету: «📋 Заполнить анкету».",
+            reply_markup=menu_start
+        )
+        return ConversationHandler.END
+
     data = ensure_data_schema()
     orders = data["orders"]
 
     if user_id in orders:
-        platform = orders[user_id]["platform"]
-        order_date = orders[user_id]["order_date"]
-    else:
-        counts = {p: sum(1 for x in orders.values() if x.get("platform") == p) for p in PLATFORMS}
-        platform = min(counts, key=counts.get) if counts else PLATFORMS[0]
+        # если ТЗ уже выдано — просто показываем кнопки этапа ТЗ
+        await update.message.reply_text(
+            "У вас уже есть ТЗ. Когда закончите — нажмите «✅ Задача выполнена» и пришлите ссылки.",
+            reply_markup=menu_task_phase
+        )
+        return ConversationHandler.END
 
-        start_dt = datetime(2025, 9, 1)
-        total = sum(counts.values())
-        week = (total // 333) + 1
-        order_date = (start_dt + timedelta(weeks=min(2, week))).strftime("%Y-%m-%d")
+    # распределение платформы
+    counts = {p: sum(1 for x in orders.values() if x.get("platform") == p) for p in PLATFORMS}
+    platform = min(counts, key=counts.get) if counts else PLATFORMS[0]
 
-        orders[user_id] = {
-            "platform": platform,
-            "order_date": order_date,
-            "status": "assigned",  # assigned -> links_received -> completed (по факту оплаты)
-            "links": []
-        }
-        save_data(data)
+    # дата заказа
+    start_dt = datetime(2025, 9, 1)
+    total = sum(counts.values())
+    week = (total // 333) + 1
+    order_date = (start_dt + timedelta(weeks=min(2, week))).strftime("%Y-%m-%d")
+
+    orders[user_id] = {
+        "platform": platform,
+        "order_date": order_date,
+        "status": "assigned",
+        "links": []
+    }
+    save_data(data)
 
     await update.message.reply_text(
-        f"Ваша платформа: *{orders[user_id]['platform']}*\n"
-        f"Дата оформления заказа: *{orders[user_id]['order_date']}*\n"
+        f"Ваша платформа: *{platform}*\n"
+        f"Дата оформления заказа: *{order_date}*\n"
         f"У вас есть 7 дней, чтобы снять ролик. В ролике обязательно:\n\n"
         f"• Упомяните бренд **Лас Играс**\n"
         f"• Назовите компанию **Сима Ленд**\n\n"
-        f"Когда закончите — нажмите «✅ Задача выполнена» и пришлите ссылки на ролик.\n"
+        f"Когда закончите — нажмите «✅ Задача выполнена» и пришлите ссылки.\n"
         f"Если не получается — «❌ Отказываюсь от сотрудничества».",
         parse_mode="Markdown",
-        reply_markup=menu_before_payment
+        reply_markup=menu_task_phase
     )
 
 # Подтверждение выполнения — просим ссылки
 async def task_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    data = ensure_data_schema()
-    if user_id not in data["orders"]:
-        await update.message.reply_text("Сначала запросите ТЗ: «📝 Получить ТЗ».", reply_markup=menu_before_payment)
+
+    # защита сценария
+    if not user_has_order(user_id):
+        await update.message.reply_text(
+            "Сначала получите ТЗ: «📝 Получить ТЗ».",
+            reply_markup=menu_start
+        )
         return ConversationHandler.END
 
-    await update.message.reply_text("Пришлите ссылку или несколько ссылок (через запятую/в отдельных сообщениях) на ролик(и).")
+    await update.message.reply_text(
+        "Пришлите ссылку или несколько ссылок (через запятую/в отдельных сообщениях) на ролик(и)."
+    )
     return WAITING_LINKS
 
 async def save_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    data = ensure_data_schema()
     text = (update.message.text or "").strip()
     if not text:
         await update.message.reply_text("Не вижу ссылок. Пришлите URL(ы).")
         return WAITING_LINKS
 
-    # извлекаем ссылки грубо (всё, что похоже на URL)
     parts = [p.strip() for p in text.replace("\n", " ").split(",") if p.strip()]
     links = []
     for p in parts:
         if p.startswith(("http://", "https://")):
             links.append(p)
-    if not links:
-        links = [text]  # на случай одной ссылки без запятых, но с http
+    if not links and (text.startswith("http://") or text.startswith("https://")):
+        links = [text]
 
-    order = data["orders"].setdefault(user_id, {"platform": None, "order_date": None, "status": "assigned", "links": []})
-    order["links"] = order.get("links", []) + links
-    order["status"] = "links_received"
-    save_data(data)
+    if not links:
+        await update.message.reply_text("Похоже, это не ссылка. Пришлите корректный URL.")
+        return WAITING_LINKS
+
+    set_order_links_received(user_id, links)
 
     await update.message.reply_text(
         "Ссылки получены ✅\nТеперь можете запросить оплату: «💸 Отправить на оплату».",
-        reply_markup=menu_after_payment
+        reply_markup=menu_after_links
     )
     return ConversationHandler.END
 
 # Отказ — запрашиваем причину
 async def decline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    data = ensure_data_schema()
-    if user_id not in data["orders"]:
-        await update.message.reply_text("Сначала запросите ТЗ: «📝 Получить ТЗ».", reply_markup=menu_before_payment)
+
+    # защита сценария
+    if not user_has_order(user_id):
+        await update.message.reply_text(
+            "У вас пока нет активного ТЗ. Сначала запросите ТЗ.",
+            reply_markup=menu_start
+        )
         return ConversationHandler.END
-    await update.message.reply_text("Жаль, что не получилось 😔\nПожалуйста, укажите причину отказа:")
+
+    await update.message.reply_text(
+        "Жаль, что не получилось 😔\nПожалуйста, укажите причину отказа:",
+        reply_markup=menu_after_decline
+    )
     return WAITING_DECLINE_REASON
 
 async def save_decline_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     reason = (update.message.text or "").strip() or "Причина не указана"
-    data = ensure_data_schema()
 
-    # логируем в отдельный файл
     append_decline(user_id, reason)
 
-    # помечаем заказ
+    data = ensure_data_schema()
     if user_id in data["orders"]:
         data["orders"][user_id]["status"] = "declined"
         save_data(data)
 
-    await update.message.reply_text("Спасибо! Мы учтём вашу причину. Если захотите вернуться — просто снова запросите ТЗ.", reply_markup=menu_before_payment)
+    await update.message.reply_text(
+        "Спасибо! Мы учтём вашу причину.\nЕсли передумаете — нажмите «🔁 Я передумал(-а)».",
+        reply_markup=menu_after_decline
+    )
     return ConversationHandler.END
+
+# Перезапуск сценария (после «Я передумал(-а)»)
+async def reconsider(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
 
 # Оплата
 async def ask_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    data = ensure_data_schema()
 
-    if user_id not in data["bloggers"]:
-        await update.message.reply_text("Сначала заполните анкету! 📋", reply_markup=menu_before_payment)
+    # защита сценария: анкета → ТЗ → ссылки → оплата
+    if not user_filled_form(user_id):
+        await update.message.reply_text("Сначала заполните анкету.", reply_markup=menu_start)
         return ConversationHandler.END
 
-    order = data["orders"].get(user_id)
-    if not order or order.get("status") not in ("links_received", "completed"):
-        await update.message.reply_text("Сначала подтвердите выполнение задачи и пришлите ссылки на ролик («✅ Задача выполнена»).", reply_markup=menu_before_payment)
+    if not user_has_order(user_id):
+        await update.message.reply_text("Сначала получите ТЗ.", reply_markup=menu_start)
         return ConversationHandler.END
 
-    await update.message.reply_text("1️⃣ Пришлите скриншот заказа:", reply_markup=menu_after_payment)
+    if order_status(user_id) != "links_received":
+        await update.message.reply_text(
+            "Сначала подтвердите выполнение задачи и пришлите ссылки («✅ Задача выполнена»).",
+            reply_markup=menu_task_phase
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text("1️⃣ Пришлите скриншот заказа:", reply_markup=menu_after_links)
     return WAITING_ORDER_PHOTO
 
 async def save_order_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -314,7 +384,6 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payments = data["payments"]
 
     payment_id = str(uuid.uuid4())
-
     payments[payment_id] = {
         "user_id": user_id,
         "order_photo": context.user_data.get("order_photo"),
@@ -326,11 +395,10 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"✅ Заявка на оплату принята. Номер: {payment_id}. Деньги поступят в течение 2-х рабочих дней.",
-        reply_markup=menu_after_payment
+        reply_markup=menu_after_links
     )
 
-    # Уведомление админу
-    ADMIN_ID = "1080067724"
+    # уведомление админу
     app = context.application
     try:
         await app.bot.send_message(ADMIN_ID, f"💰 Заявка на оплату от {user_id} (Номер: {payment_id})")
@@ -346,15 +414,13 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Связь с менеджером
 async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("По вопросам пишите: @billyinemalo1",
-                                    reply_markup=menu_after_payment if can_pay(str(update.effective_user.id)) else menu_before_payment)
+    uid = str(update.effective_user.id)
+    await update.message.reply_text(
+        "По вопросам пишите: @billyinemalo1",
+        reply_markup=guess_menu_for_user(uid)
+    )
 
-def can_pay(user_id: str) -> bool:
-    data = ensure_data_schema()
-    order = data["orders"].get(user_id)
-    return bool(order and order.get("status") in ("links_received", "completed"))
-
-# Обработка кнопок (универсальный роутер)
+# Универсальная маршрутизация кнопок
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text == "📋 Заполнить анкету":
@@ -365,14 +431,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await task_done(update, context)
     elif text == "❌ Отказываюсь от сотрудничества":
         return await decline(update, context)
+    elif text == "🔁 Я передумал(-а)":
+        return await reconsider(update, context)
     elif text == "💸 Отправить на оплату":
         return await ask_payment(update, context)
     elif text == "📞 Связаться с менеджером":
         return await contact(update, context)
 
-# Экспорт в Excel
+# Экспорт в Excel (для админа)
 async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != "1080067724":
+    if str(update.effective_user.id) != ADMIN_ID:
         return
     data = ensure_data_schema()
 
@@ -385,24 +453,37 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     orders_df.to_excel(os.path.join(DATA_DIR, "orders.xlsx"))
 
     payments_list = []
-    for payment_id, payment_data in data["payments"].items():
-        pdict = dict(payment_data)
-        pdict["payment_id"] = payment_id
-        payments_list.append(pdict)
+    for pid, pdata in data["payments"].items():
+        row = dict(pdata)
+        row["payment_id"] = pid
+        payments_list.append(row)
     payments_df = pd.DataFrame(payments_list)
     payments_df.to_excel(os.path.join(DATA_DIR, "payments.xlsx"), index=False)
 
-    await update.message.reply_text("Данные экспортированы: bloggers.xlsx, orders.xlsx, payments.xlsx")
+    # экспорт отказов
+    declines_rows = []
+    if os.path.exists(DECLINES_FILE):
+        try:
+            with open(DECLINES_FILE, "r", encoding="utf-8") as f:
+                declines_rows = json.load(f)
+                if not isinstance(declines_rows, list):
+                    declines_rows = []
+        except Exception:
+            declines_rows = []
+    if declines_rows:
+        declines_df = pd.DataFrame(declines_rows)
+    else:
+        declines_df = pd.DataFrame(columns=["user_id", "reason", "timestamp"])
+    declines_df.to_excel(os.path.join(DATA_DIR, "declines.xlsx"), index=False)
+
+    await update.message.reply_text("Данные экспортированы: bloggers.xlsx, orders.xlsx, payments.xlsx, declines.xlsx")
 
 # ---------- HEALTHCHECK (для Render) ----------
 def start_health_server():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
-        def log_message(self, *_):
-            pass
+            self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+        def log_message(self, *_): pass
 
     port = int(os.environ.get("PORT", 8080))
     srv = HTTPServer(("0.0.0.0", port), Handler)
@@ -420,11 +501,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
-    # 1) healthcheck и схема данных
     start_health_server()
     ensure_data_schema()
 
-    # 2) Telegram bot (PTB 21.x)
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_error_handler(on_error)
 
@@ -455,29 +534,28 @@ if __name__ == "__main__":
     # Подтверждение выполнения (Conversation)
     done_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("Задача выполнена"), task_done)],
-        states={
-            WAITING_LINKS: [MessageHandler(filters.TEXT, save_links)],
-        },
+        states={WAITING_LINKS: [MessageHandler(filters.TEXT, save_links)]},
         fallbacks=[],
     )
 
     # Отказ (Conversation)
     decline_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("Отказываюсь от сотрудничества"), decline)],
-        states={
-            WAITING_DECLINE_REASON: [MessageHandler(filters.TEXT, save_decline_reason)],
-        },
+        states={WAITING_DECLINE_REASON: [MessageHandler(filters.TEXT, save_decline_reason)]},
         fallbacks=[],
     )
 
-    # Регистрация хендлеров
+    # Перезапуск сценария
+    reconsider_handler = MessageHandler(filters.TEXT & filters.Regex("Я передумал(-а)"), reconsider)
+
+    # Регистрация
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("export", export_to_excel))
     app.add_handler(form_handler)
     app.add_handler(payment_handler)
     app.add_handler(done_handler)
     app.add_handler(decline_handler)
+    app.add_handler(reconsider_handler)
     app.add_handler(MessageHandler(filters.TEXT, handle_text))
 
-    # Один вызов — блокирующий polling для v21.x
     app.run_polling(drop_pending_updates=True)
