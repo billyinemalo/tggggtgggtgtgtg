@@ -66,7 +66,7 @@ if not BOT_TOKEN:
     ADMIN_WAITING_SEGCAST_TEXT,
     ADMIN_WAITING_DRAFT_TEXT,
     ADMIN_WAITING_SUPPORT_TEXT,  # текст вопроса блогеру по заявке
-) = range(19)
+) = range(18)
 
 DATA_DIR = "data"
 MEDIA_DIR = "media"
@@ -1576,3 +1576,4 @@ if __name__ == "__main__":
     app.job_queue.run_repeating(job_scan_reminders, interval=3600, first=60)
 
     app.run_polling(drop_pending_updates=True)
+
