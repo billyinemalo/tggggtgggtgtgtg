@@ -1,4 +1,4 @@
-# main.py
+#main.py
 import os
 import sys
 import json
@@ -31,28 +31,28 @@ from telegram.ext import (
     filters,
 )
 
-# ---------- ЛОГИ И ВЕРСИИ ----------
+#ЛОГИ И ВЕРСИИ
 logging.basicConfig(level=logging.INFO)
 logging.info(f"PTB_RUNTIME {telegram.__version__} | PY_RUNTIME {sys.version}")
 
-# ---------- ENV ----------
+#ENV
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     logging.error("BOT_TOKEN не найден в переменных окружения!")
 
-# ---------- КОНСТАНТЫ И ПУТИ ----------
+#КОНСТАНТЫ И ПУТИ
 (
     ASK_USERNAME,
     ASK_SUBS,
     ASK_PLATFORMS,
     ASK_THEME,
     ASK_STATS,
-    WAITING_REVIEW_PHOTO,   # скриншот отзыва (вместо заказа)
-    WAITING_BARCODE_PHOTO,  # разрезанный штрихкод
-    WAITING_WB_RECEIPT,     # только для WB — скрин чека
-    WAITING_ORDER_NUMBER,   # только для Ozon — номер заказа
-    WAITING_PAYMENT_TEXT,   # реквизиты для выплаты
+    WAITING_REVIEW_PHOTO,  
+    WAITING_BARCODE_PHOTO,  
+    WAITING_WB_RECEIPT,    
+    WAITING_ORDER_NUMBER,   
+    WAITING_PAYMENT_TEXT,   
     WAITING_LINKS,
     WAITING_DECLINE_REASON,
     ADMIN_WAITING_STATUS_USER,
@@ -67,10 +67,9 @@ MEDIA_DIR = "media"
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 DECLINES_FILE = os.path.join(DATA_DIR, "declines.json")
 PAYMENTS_EXPORT_XLSX = os.path.join(DATA_DIR, "payments_export.xlsx")
-ADMIN_ID = "1080067724"  # твой Telegram ID (строкой)
-MODERATOR_IDS: List[str] = []      # при необходимости добавь ID модераторов (строкой)
+ADMIN_ID = "1080067724"  # тг айди админа
+MODERATOR_IDS: List[str] = []      # айди модератора
 
-# Площадки
 PLATFORMS = ["Wildberries", "Ozon"]
 
 # Сегменты
@@ -81,21 +80,20 @@ SEG_REQ_PAY = "requested_pay"
 SEG_PAID = "paid"
 SEG_NOT_PAID = "not_paid"
 
-# Callback prefixes
 SEGCAST_PREFIX = "segcast:"
 SEGCONFIRM_PREFIX = "segconfirm:"
 BROADCAST_PREVIEW_CB_YES = "broadcast:yes"
 BROADCAST_PREVIEW_CB_NO = "broadcast:no"
 SEGEXPORT_PREFIX = "segexport:"
 
-# ---------- РОЛИ ----------
+#РОЛИ
 def is_admin(uid: str) -> bool:
     return uid == ADMIN_ID
 
 def is_mod(uid: str) -> bool:
     return uid in MODERATOR_IDS or is_admin(uid)
 
-# ---------- МЕНЮ ----------
+#МЕНЮ
 def with_admin(menu: ReplyKeyboardMarkup, uid: str) -> ReplyKeyboardMarkup:
     if is_mod(uid):
         rows = []
@@ -143,7 +141,7 @@ def menu_task_phase(uid: str): return with_admin(menu_task_phase_base, uid)
 def menu_after_links(uid: str): return with_admin(menu_after_links_base, uid)
 def menu_after_decline(uid: str): return with_admin(menu_after_decline_base, uid)
 
-# ---------- ПОДГОТОВКА ХРАНИЛИЩА ----------
+#ПОДГОТОВКА ХРАНИЛИЩА
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
@@ -194,7 +192,7 @@ def append_decline(user_id: str, reason: str):
     with open(DECLINES_FILE, "w", encoding="utf-8") as f:
         json.dump(items, f, ensure_ascii=False, indent=2)
 
-# ---------- УТИЛИТЫ ----------
+#УТИЛИТЫ
 def user_filled_form(user_id: str) -> bool:
     data = ensure_data_schema()
     return user_id in data["bloggers"]
@@ -293,7 +291,7 @@ def format_segment_list(title: str, uids: List[str], bloggers: Dict[str, Any], m
             break
     return "\n".join(lines)
 
-# ---- Авто-экспорт заявок в единый Excel ----
+#экспорт заявок в единый эксель
 def export_payments_excel():
     data = ensure_data_schema()
     bloggers = data.get("bloggers", {})
@@ -317,7 +315,7 @@ def export_payments_excel():
     df = pd.DataFrame(rows, columns=["Никнейм", "ТГ айди", "Данные для оплаты", "Ссылка на ролик"])
     df.to_excel(PAYMENTS_EXPORT_XLSX, index=False)
 
-# ---- Сохранение фото локально ----
+#Сохр фото локально
 async def save_photo_locally(bot, file_id: str, path: str):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -326,7 +324,7 @@ async def save_photo_locally(bot, file_id: str, path: str):
     except Exception as e:
         logging.exception(f"Не удалось сохранить файл {path}", exc_info=e)
 
-# ---------- HEALTHCHECK ----------
+#HEALTHCHECK
 def start_health_server():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -337,10 +335,10 @@ def start_health_server():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     logging.info(f"Healthcheck server started on :{port}")
 
-# ---------- ХЕНДЛЕРЫ: /start ----------
+#ХЕНДЛЕРЫ: /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    # /start ref_XXXX
+
     if context.args:
         arg = context.args[0]
         if arg.startswith("ref_"):
@@ -370,7 +368,7 @@ async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_user_flow(context, str(update.effective_user.id))
     await update.message.reply_text("Перезапускаю сценарий. Начнём сначала 👇", reply_markup=menu_start(str(update.effective_user.id)))
 
-# ----- Анкета -----
+#АНКЕТА
 async def ask_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("1. Укажите свой никнейм или название телеграм-канала:")
     return ASK_USERNAME
@@ -418,7 +416,7 @@ async def save_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-# ----- ТЗ -----
+#ТЗ
 async def send_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not user_filled_form(user_id):
@@ -438,7 +436,7 @@ async def send_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     counts = {p: sum(1 for x in orders.values() if x.get("platform") == p) for p in PLATFORMS}
     platform = min(counts, key=counts.get) if counts else PLATFORMS[0]
 
-    # оформление = завтра; дедлайн = +4 дня (на заказ/выкуп 3–4 дня)
+    # оформление = завтра; дедлайн = +4 дня (на заказ/выкуп 3-4 дня)
     today = datetime.now().date()
     order_date = (today + timedelta(days=1)).strftime("%Y-%m-%d")
     deadline = (today + timedelta(days=4)).strftime("%Y-%m-%d")
@@ -472,7 +470,7 @@ async def send_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=menu_task_phase(user_id))
 
-# Подтверждение выполнения — просим ссылки
+# Подтверждение выполнения
 async def task_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not user_has_order(user_id):
@@ -505,7 +503,7 @@ async def save_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-# Отказ — запрашиваем причину
+# Отказ
 async def decline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not user_has_order(user_id):
@@ -534,11 +532,11 @@ async def save_decline_reason(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     return ConversationHandler.END
 
-# «Я передумал(-а)»
+# «Я передумал»
 async def reconsider(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
-# ----- Оплата — пользователь -----
+#Оплата — пользователь
 async def ask_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not user_filled_form(user_id):
@@ -551,7 +549,7 @@ async def ask_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала подтвердите выполнение задачи и пришлите ссылки («✅ Задача выполнена»).", reply_markup=menu_task_phase(user_id))
         return ConversationHandler.END
 
-    # вместо скриншота заказа — просим скриншот отзыва
+    #скриншот отзыва
     await update.message.reply_text("1️⃣ Пришлите скриншот вашего *отзыва на товаре* (на площадке из ТЗ).", parse_mode="Markdown", reply_markup=menu_after_links(user_id))
     return WAITING_REVIEW_PHOTO
 
@@ -641,7 +639,7 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     save_data(data)
 
-    # авто-экспорт в единый Excel
+    #экспорт в единый эксель
     try:
         export_payments_excel()
     except Exception as e:
@@ -652,7 +650,7 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=menu_after_links(user_id)
     )
 
-    # ---- Админу: медиагруппа + одно текстовое сообщение с кнопкой ----
+    #Админу сообщ об оплате
     app = context.application
     media = []
     if context.user_data.get("review_photo"):
@@ -696,7 +694,7 @@ async def save_payment_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
-# ----- Админ: клик «Оплата произведена #... » -----
+#Оплата произведена 
 async def on_admin_pay_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(str(update.effective_user.id)):
         await update.callback_query.answer("Недостаточно прав", show_alert=True)
@@ -727,7 +725,7 @@ async def on_admin_pay_done_callback(update: Update, context: ContextTypes.DEFAU
 
     await query.message.reply_text(f"Пришлите фото чека для заявки #{payment_id}.")
 
-# --- Админ: приём чека и уведомление пользователя ---
+#прием чека вб
 async def admin_wait_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(str(update.effective_user.id)):
         return ConversationHandler.END
@@ -792,7 +790,7 @@ async def admin_wait_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("Готово. Пользователь уведомлён и получил чек.", reply_markup=menu_admin)
     return ConversationHandler.END
 
-# ----- Админ: статус по user_id -----
+#статус по айди
 async def admin_status_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_mod(str(update.effective_user.id)):
         return ConversationHandler.END
@@ -810,7 +808,7 @@ async def admin_status_wait_uid(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text(format_user_status(uid, data), reply_markup=menu_admin)
     return ConversationHandler.END
 
-# ----- Поиск -----
+#серч
 async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_mod(str(update.effective_user.id)):
         return
@@ -840,7 +838,7 @@ async def cmd_findid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пользователь не найден.", reply_markup=menu_admin); return
     await update.message.reply_text(format_user_status(uid, data), reply_markup=menu_admin)
 
-# ----- Админ: сводка и рассылки по сегментам -----
+#рассылка по сегментам
 async def admin_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_mod(str(update.effective_user.id)):
         return
@@ -942,7 +940,7 @@ async def on_segment_broadcast_confirm(update: Update, context: ContextTypes.DEF
     except Exception:
         await app.bot.send_message(ADMIN_ID, report)
 
-# Экспорт сегмента
+#экспорт сегментов
 def export_segment_to_excel(seg_key: str) -> str:
     data = ensure_data_schema()
     bloggers = data.get("bloggers", {})
@@ -977,7 +975,7 @@ async def on_segexport(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p = export_segment_to_excel(seg_key)
     await q.message.reply_document(open(p, "rb"), filename=os.path.basename(p), caption=f"Экспорт: {segment_human_name(seg_key)}")
 
-# ----- Админ: глобальная рассылка -----
+#рассылка на всех
 async def admin_broadcast_ask_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_mod(str(update.effective_user.id)):
         return ConversationHandler.END
@@ -1047,7 +1045,7 @@ async def on_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         await app.bot.send_message(ADMIN_ID, report)
 
-# ----- Черновики рассылок -----
+#черновик
 async def admin_save_draft_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_mod(str(update.effective_user.id)):
         return ConversationHandler.END
@@ -1082,7 +1080,7 @@ async def admin_list_drafts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{i}) {preview} …  ({d['ts']})")
     await update.message.reply_text("\n".join(lines), reply_markup=menu_admin)
 
-# ----- Рефералы -----
+#рефералка
 async def admin_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_mod(str(update.effective_user.id)):
         return
@@ -1096,7 +1094,7 @@ async def admin_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {ref_id}: {len(lst)} приглашённых")
     await update.message.reply_text("\n".join(lines), reply_markup=menu_admin)
 
-# ----- Неоплаченные заявки -----
+#заявки без оплаты
 async def admin_unpaid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_mod(str(update.effective_user.id)):
         return
@@ -1113,7 +1111,7 @@ async def admin_unpaid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• #{pid} — {uname} (id:{uid})")
     await update.message.reply_text("\n".join(lines), reply_markup=menu_admin)
 
-# ----- Статистика за период -----
+#стата
 def try_parse_date(s: str) -> Optional[datetime]:
     for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
         try:
@@ -1165,7 +1163,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, reply_markup=menu_admin)
 
-# ----- Связь с менеджером -----
+#написать мне
 async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     if order_status(uid) == "links_received":
@@ -1176,12 +1174,12 @@ async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = menu_start(uid)
     await update.message.reply_text("По вопросам пишите: @billyinemalo1", reply_markup=kb)
 
-# ----- Роутер по кнопкам -----
+#роутер по кнопкам
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     text = (update.message.text or "").strip()
 
-    # Админ/модератор
+    # Админ/модер
     if is_mod(uid):
         if text == "👑 Админ-меню":
             await update.message.reply_text("Админ-меню:", reply_markup=menu_admin); return
@@ -1222,7 +1220,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "📞 Связаться с менеджером":
         return await contact(update, context)
 
-# ----- Экспорт (общий) -----
+#экспорт общ
 async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_mod(str(update.effective_user.id)):
         return
@@ -1268,7 +1266,7 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=menu_admin
     )
 
-# ---------- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ----------
+#обработчик ошибок
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.exception("Unhandled exception", exc_info=context.error)
     try:
@@ -1281,7 +1279,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# ---------- АВТО-НАПОМИНАНИЯ (JobQueue — опционально) ----------
+#напоминания
 async def job_scan_reminders(context: ContextTypes.DEFAULT_TYPE):
     data = ensure_data_schema()
     orders = data.get("orders", {})
@@ -1311,7 +1309,7 @@ async def job_scan_reminders(context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
 
-    # 2) Напоминания админу по выплатам > 7 дней
+    # 2) Напоминания админу по выплатам
     for pid, p in list(payments.items()):
         if p.get("status") == "pending" and not p.get("admin_remind_sent"):
             ts = p.get("timestamp")
@@ -1334,7 +1332,7 @@ async def job_scan_reminders(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
-# ---------- ЗАПУСК ----------
+#ЗАПУСК
 if __name__ == "__main__":
     start_health_server()
     ensure_data_schema()
@@ -1355,7 +1353,7 @@ if __name__ == "__main__":
         fallbacks=[],
     )
 
-    # Оплата (пользователь): новая цепочка
+    # Оплата пользователю
     payment_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^💸 Отправить на оплату$"), ask_payment)],
         states={
@@ -1382,35 +1380,35 @@ if __name__ == "__main__":
         fallbacks=[],
     )
 
-    # Админ: статус по пользователю
+    #статус по пользователю
     admin_status_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^📊 Статус по пользователю$"), admin_status_start)],
         states={ADMIN_WAITING_STATUS_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_status_wait_uid)]},
         fallbacks=[],
     )
 
-    # Админ: ожидание чека после нажатия inline-кнопки
+    #ожидание чека после нажатия кнопки
     admin_receipt_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.PHOTO & filters.User(user_id=int(ADMIN_ID)), admin_wait_receipt)],
         states={ADMIN_WAITING_RECEIPT: [MessageHandler(filters.PHOTO, admin_wait_receipt)]},
         fallbacks=[],
     )
 
-    # Админ: глобальная рассылка
+    #глобальная рассылка
     admin_broadcast_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^📣 Рассылка$"), admin_broadcast_ask_text)],
         states={ADMIN_WAITING_BROADCAST_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_text)]},
         fallbacks=[],
     )
 
-    # Админ: сохранение черновика
+    #сохранение черновика
     admin_draft_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^💾 Сохранить черновик$"), admin_save_draft_ask)],
         states={ADMIN_WAITING_DRAFT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_save_draft_text)]},
         fallbacks=[],
     )
 
-    # Админ: рассылка по сегменту
+    #рассылка по сегменту
     admin_segcast_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(on_segcast_choose, pattern=r"^segcast:")],
         states={
@@ -1451,7 +1449,7 @@ if __name__ == "__main__":
     app.add_handler(restart_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Периодические напоминания — только если доступен JobQueue
+    # Периодические напоминания
     if getattr(app, "job_queue", None):
         try:
             app.job_queue.run_repeating(job_scan_reminders, interval=3600, first=60)
@@ -1461,3 +1459,4 @@ if __name__ == "__main__":
         logging.info("JobQueue недоступен (PTB без extras). Напоминания отключены.")
 
     app.run_polling(drop_pending_updates=True)
+
